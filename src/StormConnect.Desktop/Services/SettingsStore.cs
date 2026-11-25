@@ -98,6 +98,11 @@ public sealed class SettingsStore
             Current = new AppSettings();
         }
 
+        if (string.Equals(Current.RelayUrl, "wss://stormgamesworld.ru/connect-relay", StringComparison.OrdinalIgnoreCase))
+        {
+            Current.RelayUrl = "";
+            Save();
+        }
         if (DeviceIdentity.NormalizeId(Current.StormId).Length != 9)
         {
             Current.StormId = GenerateStormId();

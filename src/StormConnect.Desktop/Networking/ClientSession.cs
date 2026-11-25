@@ -2,10 +2,12 @@ using System.Collections.Concurrent;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
@@ -122,27 +124,36 @@ public sealed class ClientSession : IAsyncDisposable
                 }
             }
 
-            // 3. Fallback to WSS Relay unless Direct-Only is forced
+            // 3. Fallback to Custom WSS Relay or Built-in Zero-Server Public MQTT-WSS Mesh
             if (rawChannel is null && preferredMethodIndex != 1)
             {
                 StatusChanged?.Invoke(Services.LocalizationService.T("StatusConnectingRelay"));
-                rawChannel = await ConnectViaRelayAsync(normDigits, relayUrl, token).ConfigureAwait(false);
+                rawChannel = await ConnectViaRelayOrMeshAsync(normDigits, relayUrl, preferredMethodIndex == 3, token).ConfigureAwait(false);
             }
         }
 
         if (rawChannel is null)
             throw new IOException(Services.LocalizationService.T("StatusConnFailed"));
 
-        // 4. ECDH P-256 + AES-256-GCM Handshake (Client is Initiator)
-        using var crypto = new CryptoSession();
-        var hostKeyPkt = await rawChannel.ReceivePacketAsync(token).ConfigureAwait(false);
-        if (hostKeyPkt is null || hostKeyPkt.Type != PacketType.KeyExchange)
-            throw new IOException("Host closed during key exchange.");
+        // 4. ECDH P-256 + AES-256-GCM Handshake (Client is Initiator; ownership moves to EncryptedTransportChannel)
+        var crypto = new CryptoSession();
+        try
+        {
+            var hostKeyPkt = await rawChannel.ReceivePacketAsync(token).ConfigureAwait(false);
+            if (hostKeyPkt is null || hostKeyPkt.Type != PacketType.KeyExchange)
+                throw new IOException("Host closed during key exchange.");
 
-        await rawChannel.SendPacketAsync(PacketType.KeyExchange, crypto.LocalPublicKeyUncompressed, ct: token).ConfigureAwait(false);
-        crypto.DeriveKeys(hostKeyPkt.Payload, isInitiator: true);
+            await rawChannel.SendPacketAsync(PacketType.KeyExchange, crypto.LocalPublicKeyUncompressed, ct: token).ConfigureAwait(false);
+            crypto.DeriveKeys(hostKeyPkt.Payload, isInitiator: true);
 
-        _channel = new EncryptedTransportChannel(rawChannel, crypto);
+            _channel = new EncryptedTransportChannel(rawChannel, crypto);
+        }
+        catch
+        {
+            crypto.Dispose();
+            await rawChannel.DisposeAsync().ConfigureAwait(false);
+            throw;
+        }
         Telemetry.Mode = _channel.Mode;
 
         // 5. Read Hello + AuthChallenge
@@ -234,15 +245,61 @@ public sealed class ClientSession : IAsyncDisposable
             catch { }
         }
 
-        if (!directOnly && !string.IsNullOrWhiteSpace(relayUrl))
+        if (!directOnly)
         {
             try
             {
-                return await ConnectViaRelayAsync(DeviceIdentity.NormalizeId(invite.StormId), relayUrl, ct).ConfigureAwait(false);
+                return await ConnectViaRelayOrMeshAsync(DeviceIdentity.NormalizeId(invite.StormId), relayUrl, false, ct).ConfigureAwait(false);
             }
             catch { }
         }
         return null;
+    }
+
+    private async Task<ITransportChannel> ConnectViaRelayOrMeshAsync(string targetId, string relayUrl, bool strictCustomRelay, CancellationToken ct)
+    {
+        if (!string.IsNullOrWhiteSpace(relayUrl))
+        {
+            try
+            {
+                return await ConnectViaRelayAsync(targetId, relayUrl, ct).ConfigureAwait(false);
+            }
+            catch when (!strictCustomRelay)
+            {
+                // Auto-cascade to built-in zero-server Public MQTT-WSS Mesh if custom relay is unreachable/502
+            }
+        }
+        return await ConnectViaPublicMeshAsync(targetId, ct).ConfigureAwait(false);
+    }
+
+    private async Task<ITransportChannel> ConnectViaPublicMeshAsync(string targetId, CancellationToken ct)
+    {
+        Exception? lastErr = null;
+        foreach (var brokerUrl in ProtocolConstants.PublicMqttWssBrokers)
+        {
+            var mqtt = new MqttWssClient();
+            try
+            {
+                string cid = $"sc_c_{_localStormId}_{Guid.NewGuid().ToString("N")[..6]}";
+                await mqtt.ConnectAsync(brokerUrl, cid, ct).ConfigureAwait(false);
+
+                string token = Guid.NewGuid().ToString("N");
+                var pipe = new MqttPipeTransportChannel(mqtt, token, isInitiator: true);
+                await pipe.SubscribeRxAsync(ct).ConfigureAwait(false);
+
+                var inviteJson = JsonSerializer.SerializeToUtf8Bytes(new { Token = token, FromStormId = _localStormId });
+                await mqtt.PublishAsync($"sc/v1/s/{targetId}", inviteJson, ct).ConfigureAwait(false);
+
+                // Wait briefly for host to respond with KeyExchange; if this broker fails, next broker is tried
+                return pipe;
+            }
+            catch (Exception ex)
+            {
+                lastErr = ex;
+                await mqtt.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+        throw lastErr ?? new IOException("All public WSS mesh relays unreachable.");
     }
 
     private static async Task<ITransportChannel> ConnectDirectTcpAsync(string hostSpec, int defaultPort, ConnectionMode mode, CancellationToken ct)
@@ -272,11 +329,19 @@ public sealed class ClientSession : IAsyncDisposable
             }
         }
 
-        var tcp = new TcpClient(AddressFamily.InterNetworkV6);
-        tcp.Client.DualMode = true;
+        IPAddress targetIp;
+        if (!IPAddress.TryParse(host, out targetIp!))
+        {
+            var addrs = await Dns.GetHostAddressesAsync(host, ct).ConfigureAwait(false);
+            targetIp = addrs.FirstOrDefault(a => a.AddressFamily == AddressFamily.InterNetwork)
+                    ?? addrs.FirstOrDefault()
+                    ?? throw new SocketException((int)SocketError.HostNotFound);
+        }
+
+        var tcp = new TcpClient(targetIp.AddressFamily);
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
-        await tcp.ConnectAsync(host, port, timeoutCts.Token).ConfigureAwait(false);
+        await tcp.ConnectAsync(targetIp, port, timeoutCts.Token).ConfigureAwait(false);
         return new TcpTransportChannel(tcp, mode);
     }
 

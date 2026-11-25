@@ -30,7 +30,7 @@ object ProtocolConstants {
     const val FLAG_COMPRESSED: Byte = 0x01
     const val DEFAULT_DIRECT_PORT = 7440
     const val DEFAULT_LAN_PORT = 7445
-    const val DEFAULT_RELAY_URL = "wss://stormgamesworld.ru/connect-relay"
+    const val DEFAULT_RELAY_URL = ""
     const val FILE_CHUNK_BYTES = 256 * 1024
 }
 

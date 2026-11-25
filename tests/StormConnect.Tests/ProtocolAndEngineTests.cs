@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using StormConnect.Desktop.Engine;
+using StormConnect.Desktop.Networking;
 using StormConnect.Desktop.Services;
 using StormConnect.Protocol;
 using Xunit;
@@ -222,5 +223,119 @@ public sealed class ProtocolAndEngineTests
             Assert.Equal(a.Name, a.ToString());
         foreach (var f in ThemeService.Fonts)
             Assert.Equal(f.DisplayName, f.ToString());
+    }
+
+    [Fact]
+    public async Task EndToEnd_DirectTcp_AuthMonitorListFileListAndKeepAlive()
+    {
+        const string hostId = "900111222";
+        const string clientId = "900333444";
+        const string pin = "654321";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        host.Start(0, "", enableRelay: false);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (host.ListeningPort == 0 && sw.ElapsedMilliseconds < 3000) await Task.Delay(25);
+        Assert.True(host.ListeningPort > 0);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        var monsTcs = new TaskCompletionSource<IReadOnlyList<MonitorInfo>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var filesTcs = new TaskCompletionSource<FileListResponsePayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MonitorsUpdated += m => monsTcs.TrySetResult(m);
+        client.FileListReceived += f => filesTcs.TrySetResult(f);
+
+        await client.ConnectAsync($"127.0.0.1:{host.ListeningPort}", "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin));
+        Assert.True(client.IsConnected);
+
+        var mons = await monsTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotEmpty(mons);
+
+        // Wait > 1.2s so PingLoop executes and proves CryptoSession remained alive after ConnectAsync
+        await Task.Delay(1300);
+        Assert.True(client.IsConnected);
+
+        await client.RequestFileListAsync("");
+        var files = await filesTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.NotEmpty(files.Entries);
+    }
+
+    [Fact]
+    public async Task EndToEnd_InviteCode_ServerlessConnect()
+    {
+        const string hostId = "811222333";
+        const string clientId = "811444555";
+        const string pin = "112233";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        host.Start(0, "", enableRelay: false);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (host.ListeningPort == 0 && sw.ElapsedMilliseconds < 3000) await Task.Delay(25);
+
+        string code = InviteCode.Encode(new InviteCodePayload(hostId, "HOST", host.ListeningPort, "127.0.0.1", null, null, 0, null, null));
+        await using var client = new ClientSession(clientId, clientClip);
+        await client.ConnectAsync(code, "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin), preferredMethodIndex: 2);
+        Assert.True(client.IsConnected);
+        Assert.Equal(ConnectionMode.LanDirect, client.Telemetry.Mode);
+    }
+
+    [Fact]
+    public async Task EndToEnd_PublicMqttWss_9DigitStormId_LiveConnect()
+    {
+        string hostId = RandomNumberGenerator.GetInt32(700_000_000, 799_999_999).ToString();
+        string clientId = RandomNumberGenerator.GetInt32(600_000_000, 699_999_999).ToString();
+        const string pin = "778899";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        host.Start(0, "", enableRelay: true);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!host.IsRelayConnected && sw.ElapsedMilliseconds < 10000) await Task.Delay(100);
+        Assert.True(host.IsRelayConnected, "Host failed to join Public MQTT-WSS Mesh");
+
+        await using var client = new ClientSession(clientId, clientClip);
+        var monsTcs = new TaskCompletionSource<IReadOnlyList<MonitorInfo>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var filesTcs = new TaskCompletionSource<FileListResponsePayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MonitorsUpdated += m => monsTcs.TrySetResult(m);
+        client.FileListReceived += f => filesTcs.TrySetResult(f);
+
+        await client.ConnectAsync(hostId, "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin), preferredMethodIndex: 3);
+        Assert.True(client.IsConnected);
+        Assert.Equal(ConnectionMode.WssRelay, client.Telemetry.Mode);
+
+        var mons = await monsTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.NotEmpty(mons);
+
+        await client.RequestFileListAsync("");
+        var files = await filesTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.NotEmpty(files.Entries);
     }
 }

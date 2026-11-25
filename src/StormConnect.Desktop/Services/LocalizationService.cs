@@ -77,8 +77,8 @@ public static class LocalizationService
             ["OneTimePin"] = "ONE-TIME PIN",
             ["RefreshPin"] = "Refresh PIN",
             ["IncomingStatus"] = "Incoming Access",
-            ["RelayOnline"] = "Relay Online",
-            ["RelayOffline"] = "Direct / Serverless Ready",
+            ["RelayOnline"] = "Serverless Mesh / Relay Online",
+            ["RelayOffline"] = "Direct LAN / IPv6 Ready",
             ["ActiveIncoming"] = "Active Guests",
 
             ["QuickConnectTitle"] = "CONNECT TO REMOTE DEVICE",
@@ -246,7 +246,7 @@ public static class LocalizationService
             ["OneTimePin"] = "ОДНОРАЗОВЫЙ PIN",
             ["RefreshPin"] = "Обновить PIN",
             ["IncomingStatus"] = "Входящий доступ",
-            ["RelayOnline"] = "Ретранслятор онлайн",
+            ["RelayOnline"] = "Сеть без сервера / Онлайн",
             ["RelayOffline"] = "Прямой режим (без сервера)",
             ["ActiveIncoming"] = "Активные гости",
 

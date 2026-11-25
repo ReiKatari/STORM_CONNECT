@@ -8,6 +8,8 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import com.storm.connect.protocol.EncryptedTransportChannel
+import com.storm.connect.protocol.MqttPipeTransportChannel
+import com.storm.connect.protocol.MqttWssClient
 import com.storm.connect.protocol.PacketType
 import com.storm.connect.protocol.ProtocolConstants
 import com.storm.connect.protocol.StormCrypto
@@ -333,46 +335,70 @@ class RemoteSessionClient(
     }
 
     private suspend fun connectViaRelay(targetId: String, relayUrl: String): TransportChannel {
-        onStatus?.invoke("Connecting via STORM CONNECT Relay...")
-        val ctrl = WsTransportChannel(relayUrl, "WssRelay")
-        if (!ctrl.awaitOpen()) error("Cannot reach Relay server")
+        if (relayUrl.isNotBlank()) {
+            try {
+                onStatus?.invoke("Connecting via STORM CONNECT Relay...")
+                val ctrl = WsTransportChannel(relayUrl, "WssRelay")
+                if (ctrl.awaitOpen()) {
+                    val reg = JSONObject().apply {
+                        put("StormId", localStormId)
+                        put("HostName", android.os.Build.MODEL)
+                        put("OsName", "Android")
+                        put("MonitorCount", 1)
+                        put("DirectPort", ProtocolConstants.DEFAULT_DIRECT_PORT)
+                    }.toString().toByteArray(Charsets.UTF_8)
+                    ctrl.sendPacket(PacketType.RelayRegister, reg)
 
-        val reg = JSONObject().apply {
-            put("StormId", localStormId)
-            put("HostName", android.os.Build.MODEL)
-            put("OsName", "Android")
-            put("MonitorCount", 1)
-            put("DirectPort", ProtocolConstants.DEFAULT_DIRECT_PORT)
-        }.toString().toByteArray(Charsets.UTF_8)
-        ctrl.sendPacket(PacketType.RelayRegister, reg)
+                    val conn = JSONObject().apply {
+                        put("FromStormId", localStormId)
+                        put("TargetStormId", targetId)
+                    }.toString().toByteArray(Charsets.UTF_8)
+                    ctrl.sendPacket(PacketType.RelayConnect, conn)
 
-        val conn = JSONObject().apply {
-            put("FromStormId", localStormId)
-            put("TargetStormId", targetId)
-        }.toString().toByteArray(Charsets.UTF_8)
-        ctrl.sendPacket(PacketType.RelayConnect, conn)
+                    var token: String? = null
+                    while (true) {
+                        val pkt = ctrl.receivePacket() ?: break
+                        if (pkt.type == PacketType.RelayError) break
+                        if (pkt.type == PacketType.RelayPaired) {
+                            token = JSONObject(String(pkt.payload, Charsets.UTF_8)).getString("SessionToken")
+                            break
+                        }
+                    }
+                    ctrl.close()
+                    if (token != null) {
+                        val uri = URI(relayUrl)
+                        val pipeUrl = "${uri.scheme}://${uri.authority}/session/$token?role=initiator"
+                        val pipe = WsTransportChannel(pipeUrl, "WssRelay")
+                        if (pipe.awaitOpen()) return pipe
+                    }
+                }
+            } catch (_: Exception) {}
+        }
 
-        var token: String? = null
-        while (true) {
-            val pkt = ctrl.receivePacket() ?: break
-            if (pkt.type == PacketType.RelayError) {
-                val msg = String(pkt.payload, Charsets.UTF_8)
-                ctrl.close()
-                error(msg)
-            }
-            if (pkt.type == PacketType.RelayPaired) {
-                val paired = JSONObject(String(pkt.payload, Charsets.UTF_8))
-                token = paired.getString("SessionToken")
-                break
+        // Built-in Zero-Server Public MQTT-WSS Mesh fallback
+        onStatus?.invoke("Connecting via Serverless WSS Mesh...")
+        for (brokerUrl in MqttWssClient.PUBLIC_BROKERS) {
+            val mqtt = MqttWssClient()
+            try {
+                val cid = "sc_ac_${localStormId}_${UUID.randomUUID().toString().take(6)}"
+                if (!mqtt.connect(brokerUrl, cid)) {
+                    mqtt.close()
+                    continue
+                }
+                val token = UUID.randomUUID().toString().replace("-", "")
+                val pipe = MqttPipeTransportChannel(mqtt, token, isInitiator = true)
+                pipe.subscribeRx()
+                val invite = JSONObject().apply {
+                    put("Token", token)
+                    put("FromStormId", localStormId)
+                }.toString().toByteArray(Charsets.UTF_8)
+                mqtt.publish("sc/v1/s/$targetId", invite)
+                return pipe
+            } catch (_: Exception) {
+                mqtt.close()
             }
         }
-        ctrl.close()
-        val tok = token ?: error("Relay pairing failed")
-        val uri = URI(relayUrl)
-        val pipeUrl = "${uri.scheme}://${uri.authority}/session/$tok?role=initiator"
-        val pipe = WsTransportChannel(pipeUrl, "WssRelay")
-        if (!pipe.awaitOpen()) error("Relay pipe failed")
-        return pipe
+        error("Unable to reach any relay or mesh broker")
     }
 
     private suspend fun receiveLoop(enc: TransportChannel) {

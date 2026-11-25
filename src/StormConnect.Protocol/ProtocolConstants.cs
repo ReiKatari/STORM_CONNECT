@@ -14,8 +14,15 @@ public static class ProtocolConstants
     public const int FileChunkBytes = 256 * 1024; // 256 KB streaming chunks
     public const int TileSize = 64;
 
-    public const string DefaultRelayUrl = "wss://stormgamesworld.ru/connect-relay";
+    public const string DefaultRelayUrl = "";
     public const string DefaultStunServer = "stun.l.google.com:19302";
+
+    public static readonly string[] PublicMqttWssBrokers =
+    [
+        "wss://broker.emqx.io:8084/mqtt",
+        "wss://broker.hivemq.com:8884/mqtt",
+        "wss://test.mosquitto.org:8081/mqtt"
+    ];
 }
 
 public enum PacketType : byte
