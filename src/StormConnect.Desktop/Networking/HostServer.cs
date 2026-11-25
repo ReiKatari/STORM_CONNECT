@@ -41,7 +41,7 @@ public sealed class HostServer : IAsyncDisposable
     private readonly Func<(string? Hash, byte[]? Salt)> _getUnattendedCredentials;
     private readonly Func<SessionPermissions> _getDefaultPermissions;
     private readonly Func<bool> _getAllowIncoming;
-    private readonly Func<IncomingConsentRequest, Task<ConsentDecisionPayload>> _consentPrompt;
+    private readonly Func<IncomingConsentRequest, CancellationToken, Task<ConsentDecisionPayload>> _consentPrompt;
     private readonly ClipboardWatcher _clipboard;
 
     private TcpListener? _listener;
@@ -73,6 +73,19 @@ public sealed class HostServer : IAsyncDisposable
         Func<SessionPermissions> getDefaultPermissions,
         Func<bool> getAllowIncoming,
         Func<IncomingConsentRequest, Task<ConsentDecisionPayload>> consentPrompt,
+        ClipboardWatcher clipboard)
+        : this(stormId, getPin, getUnattendedCredentials, getDefaultPermissions, getAllowIncoming,
+            (req, _) => consentPrompt(req), clipboard)
+    {
+    }
+
+    public HostServer(
+        string stormId,
+        Func<string> getPin,
+        Func<(string? Hash, byte[]? Salt)> getUnattendedCredentials,
+        Func<SessionPermissions> getDefaultPermissions,
+        Func<bool> getAllowIncoming,
+        Func<IncomingConsentRequest, CancellationToken, Task<ConsentDecisionPayload>> consentPrompt,
         ClipboardWatcher clipboard)
     {
         _stormId = DeviceIdentity.NormalizeId(stormId);
@@ -373,7 +386,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.1", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.2", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -386,52 +399,87 @@ public sealed class HostServer : IAsyncDisposable
                 AllowUnattended: !string.IsNullOrWhiteSpace(unattHash) && unattSalt is not null);
             await channel.SendPacketAsync(PacketType.AuthRequest, FrameCodec.SerializeJson(challenge), ct: ct).ConfigureAwait(false);
 
-            // 3. Receive AuthRequest from Client
+            bool VerifySecretProof(string? proof)
+            {
+                if (string.IsNullOrWhiteSpace(proof)) return false;
+                if (!string.IsNullOrWhiteSpace(unattHash) && CryptoSession.VerifyChallengeProof(unattHash, challengeNonce, proof))
+                    return true;
+                var pinHash = CryptoSession.HashPassword(_getPin(), challenge.Salt);
+                return CryptoSession.VerifyChallengeProof(pinHash, challengeNonce, proof);
+            }
+
+            // 3. Receive initial AuthRequest from Client
             var authPkt = await channel.ReceivePacketAsync(ct).ConfigureAwait(false);
             if (authPkt is null || authPkt.Type != PacketType.AuthRequest) return;
             var authReq = FrameCodec.DeserializeJson<AuthRequestPayload>(authPkt.Payload);
             if (authReq is null) return;
 
             var perms = _getDefaultPermissions().Clone();
-            bool authorized = false;
-
-            if (!string.IsNullOrWhiteSpace(authReq.PinOrPasswordProof))
-            {
-                if (!string.IsNullOrWhiteSpace(unattHash))
-                {
-                    authorized = CryptoSession.VerifyChallengeProof(unattHash, challengeNonce, authReq.PinOrPasswordProof);
-                }
-                if (!authorized)
-                {
-                    var pinHash = CryptoSession.HashPassword(_getPin(), challenge.Salt);
-                    authorized = CryptoSession.VerifyChallengeProof(pinHash, challengeNonce, authReq.PinOrPasswordProof);
-                }
-            }
+            bool authorized = VerifySecretProof(authReq.PinOrPasswordProof);
+            Task<SconPacket?>? pendingRxTask = null;
 
             if (!authorized)
             {
-                // Ask local user via Consent Modal
+                // Notify client that manual approval or PIN/password is needed, and show Host Consent Modal simultaneously
                 await channel.SendPacketAsync(
                     PacketType.AuthResponse,
                     FrameCodec.SerializeJson(new AuthResponsePayload(false, true, Services.LocalizationService.T("StatusWaitingConsent"), perms)),
                     ct: ct).ConfigureAwait(false);
 
-                var decision = await _consentPrompt(new IncomingConsentRequest(
+                using var consentCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var consentTask = _consentPrompt(new IncomingConsentRequest(
                     authReq.ClientStormId,
                     authReq.ClientName,
                     remoteEndpoint,
                     channel.Mode,
-                    perms)).ConfigureAwait(false);
+                    perms), consentCts.Token);
 
-                if (!decision.Accepted)
+                var authRxTask = channel.ReceivePacketAsync(ct);
+
+                while (!authorized)
                 {
-                    await channel.SendPacketAsync(
-                        PacketType.AuthResponse,
-                        FrameCodec.SerializeJson(new AuthResponsePayload(false, false, Services.LocalizationService.T("StatusDeclinedByHost"), perms)),
-                        ct: ct).ConfigureAwait(false);
-                    return;
+                    var finished = await Task.WhenAny(consentTask, authRxTask).ConfigureAwait(false);
+                    if (finished == consentTask)
+                    {
+                        var decision = await consentTask.ConfigureAwait(false);
+                        if (!decision.Accepted)
+                        {
+                            await channel.SendPacketAsync(
+                                PacketType.AuthResponse,
+                                FrameCodec.SerializeJson(new AuthResponsePayload(false, false, Services.LocalizationService.T("StatusDeclinedByHost"), perms)),
+                                ct: ct).ConfigureAwait(false);
+                            return;
+                        }
+                        perms = decision.Permissions;
+                        pendingRxTask = authRxTask; // preserve in-flight read without cancelling socket
+                        authorized = true;
+                        break;
+                    }
+                    else
+                    {
+                        var nextPkt = await authRxTask.ConfigureAwait(false);
+                        if (nextPkt is null || nextPkt.Type == PacketType.Disconnect)
+                        {
+                            consentCts.Cancel();
+                            return;
+                        }
+                        if (nextPkt.Type == PacketType.AuthRequest)
+                        {
+                            var retryReq = FrameCodec.DeserializeJson<AuthRequestPayload>(nextPkt.Payload);
+                            if (retryReq is not null && VerifySecretProof(retryReq.PinOrPasswordProof))
+                            {
+                                consentCts.Cancel(); // closes Host Consent Modal automatically!
+                                authorized = true;
+                                break;
+                            }
+                            await channel.SendPacketAsync(
+                                PacketType.AuthResponse,
+                                FrameCodec.SerializeJson(new AuthResponsePayload(false, true, Services.LocalizationService.T("StatusWrongPinOrPwd"), perms)),
+                                ct: ct).ConfigureAwait(false);
+                        }
+                        authRxTask = channel.ReceivePacketAsync(ct);
+                    }
                 }
-                perms = decision.Permissions;
             }
 
             await channel.SendPacketAsync(
@@ -450,14 +498,16 @@ public sealed class HostServer : IAsyncDisposable
             _activeClients[sessionId] = channel;
             _activeContexts[sessionId] = ctx;
             ClientConnected?.Invoke(ctx);
+            Services.SessionLogger.Log("HOST", $"Session started: {authReq.ClientName} ({authReq.ClientStormId}) via {channel.Mode}");
             AuditLogEvent?.Invoke($"Session started: {authReq.ClientName} ({authReq.ClientStormId}) via {channel.Mode}");
 
             await channel.SendPacketAsync(PacketType.MonitorList, FrameCodec.SerializeJson(monitors), ct: ct).ConfigureAwait(false);
-            await RunHostSessionLoopAsync(channel, ctx, ct).ConfigureAwait(false);
+            await RunHostSessionLoopAsync(channel, ctx, pendingRxTask, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            Services.SessionLogger.Log("HOST", $"Session ended ({sessionId}): {ex.Message}");
             AuditLogEvent?.Invoke($"Host session ended ({sessionId}): {ex.Message}");
         }
         finally
@@ -470,7 +520,7 @@ public sealed class HostServer : IAsyncDisposable
         }
     }
 
-    private async Task RunHostSessionLoopAsync(ITransportChannel channel, HostSessionContext ctx, CancellationToken parentCt)
+    private async Task RunHostSessionLoopAsync(ITransportChannel channel, HostSessionContext ctx, Task<SconPacket?>? pendingRxTask, CancellationToken parentCt)
     {
         using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(parentCt);
         var ct = sessionCts.Token;
@@ -498,61 +548,95 @@ public sealed class HostServer : IAsyncDisposable
 
         var activeUploads = new ConcurrentDictionary<string, (FileStream Stream, long TotalBytes, long Received, string Path, string ExpectedSha)>();
 
-        // Video streaming loop
-        bool firstRelayFrame = channel.Mode == ConnectionMode.WssRelay;
-        var videoTask = Task.Run(async () =>
+        // Dedicated OS thread so SetThreadDesktop stays pinned to WinSta0\Default / UAC / Lock desktop
+        bool loggedFirstFrame = false;
+        var videoDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var captureThread = new Thread(() =>
         {
-            while (!ct.IsCancellationRequested && channel.IsConnected)
+            int lastBytesSent = 0;
+            try
             {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
-                try
+                while (!ct.IsCancellationRequested && channel.IsConnected)
                 {
-                    int mon = Volatile.Read(ref activeMonitor);
-                    var frame = capturer.Capture(mon);
-                    if (frame is not null)
+                    var sw = System.Diagnostics.Stopwatch.StartNew();
+                    try
                     {
-                        bool key = forceKeyFrame;
-                        forceKeyFrame = false;
-                        bool ultraFastFirst = key && firstRelayFrame;
-                        firstRelayFrame = false;
-                        int encQuality = ultraFastFirst ? Math.Min(45, targetQuality) : targetQuality;
-                        int maxWidth = channel.Mode == ConnectionMode.WssRelay
-                            ? (ultraFastFirst ? 1024 : (mon == -1 ? 1600 : 1280))
-                            : 0;
-                        var update = encoder.Encode(frame, encQuality, key, maxWidth);
-                        if (update is not null)
+                        int mon = Volatile.Read(ref activeMonitor);
+                        int maxWidth = channel.Mode == ConnectionMode.WssRelay ? (mon == -1 ? 1440 : 1280) : 0;
+                        var frame = capturer.Capture(mon, maxWidth);
+                        if (frame is not null)
                         {
-                            var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
-                            await channel.SendPacketAsync(
-                                update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles,
-                                bytes,
-                                compress: false,
-                                ct).ConfigureAwait(false);
+                            bool key = forceKeyFrame;
+                            forceKeyFrame = false;
+                            int budgetBytes = channel.Mode == ConnectionMode.WssRelay ? 54 * 1024 : 0;
+                            var update = encoder.EncodeWithSizeBudget(frame, targetQuality, key, maxWidth, budgetBytes);
+                            if (update is not null)
+                            {
+                                var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
+                                lastBytesSent = bytes.Length;
+                                channel.SendPacketAsync(
+                                    update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles,
+                                    bytes,
+                                    compress: false,
+                                    ct).GetAwaiter().GetResult();
+
+                                if (!loggedFirstFrame)
+                                {
+                                    loggedFirstFrame = true;
+                                    Services.SessionLogger.Log("HOST", $"Sent video frame: full={update.IsFullFrame} {update.FrameWidth}x{update.FrameHeight} bytes={bytes.Length}");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            Services.SessionLogger.Log("HOST", $"Capture returned null for monitor {mon}");
                         }
                     }
-                }
-                catch (OperationCanceledException) { break; }
-                catch (Exception ex)
-                {
-                    AuditLogEvent?.Invoke($"Video send loop ended: {ex.Message}");
-                    if (!channel.IsConnected) break;
-                }
-
-                int elapsed = (int)sw.ElapsedMilliseconds;
-                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 90 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
-                if (elapsed < targetInterval)
-                {
-                    try { await Task.Delay(targetInterval - elapsed, ct).ConfigureAwait(false); }
                     catch (OperationCanceledException) { break; }
+                    catch (Exception ex)
+                    {
+                        Services.SessionLogger.Log("HOST", $"Video loop error: {ex.Message}");
+                        AuditLogEvent?.Invoke($"Video send loop error: {ex.Message}");
+                        if (!channel.IsConnected) break;
+                    }
+
+                    int elapsed = (int)sw.ElapsedMilliseconds;
+                    int targetInterval = channel.Mode == ConnectionMode.WssRelay
+                        ? Math.Max(90, Math.Min(350, lastBytesSent / 320))
+                        : 20;
+                    lastBytesSent = 0;
+                    if (elapsed < targetInterval)
+                    {
+                        if (ct.WaitHandle.WaitOne(targetInterval - elapsed)) break;
+                    }
                 }
             }
-        }, ct);
+            finally
+            {
+                videoDone.TrySetResult();
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "StormCapture"
+        };
+        captureThread.Start();
+        var videoTask = videoDone.Task;
 
         try
         {
             while (!ct.IsCancellationRequested && channel.IsConnected)
             {
-                var pkt = await channel.ReceivePacketAsync(ct).ConfigureAwait(false);
+                SconPacket? pkt;
+                if (pendingRxTask is not null)
+                {
+                    pkt = await pendingRxTask.ConfigureAwait(false);
+                    pendingRxTask = null;
+                }
+                else
+                {
+                    pkt = await channel.ReceivePacketAsync(ct).ConfigureAwait(false);
+                }
                 if (pkt is null || pkt.Type == PacketType.Disconnect) break;
 
                 switch (pkt.Type)

@@ -23,7 +23,7 @@ app.UseWebSockets(new WebSocketOptions { KeepAliveInterval = TimeSpan.FromSecond
 app.MapGet("/health", (RelayHub hub) => Results.Ok(new
 {
     service = "STORM CONNECT Relay",
-    version = "1.3.1",
+    version = "1.3.2",
     peersOnline = hub.ActivePeerCount,
     activeSessions = hub.ActiveBridgeCount,
     relayedBytes = hub.TotalRelayedBytes,

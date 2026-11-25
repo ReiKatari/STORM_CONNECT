@@ -52,9 +52,10 @@ public partial class MainWindow : Window
     private string? _stunUdpEndpoint;
 
     private TaskCompletionSource<ConsentDecisionPayload>? _consentTcs;
-    private TaskCompletionSource<string?>? _authTcs;
+    private DualAuthContext? _activeDualAuth;
     private bool _lastAuthRemember;
     private string _lastAuthAlias = string.Empty;
+    private string? _lastAuthEnteredSecret;
     private IReadOnlyList<MonitorInfo> _currentMonitors = [];
 
     public MainWindow()
@@ -526,10 +527,10 @@ public partial class MainWindow : Window
         string? savedSecret = savedEntry is not null && savedEntry.AutoLoginWithPassword
             ? SettingsStore.UnprotectSecret(savedEntry.SavedPasswordProtectedBase64)
             : null;
-        bool usedSavedSecret = false;
-        string? lastEnteredSecret = null;
+        bool hasSavedSecret = !string.IsNullOrWhiteSpace(savedSecret);
         _lastAuthRemember = false;
         _lastAuthAlias = savedEntry?.Alias ?? string.Empty;
+        _lastAuthEnteredSecret = null;
 
         _clientSession = new ClientSession(s.StormId, _clipboardWatcher);
         _clientSession.StatusChanged += msg => Dispatcher.Invoke(() => TxtConnectStatus.Text = msg);
@@ -582,38 +583,30 @@ public partial class MainWindow : Window
             CmbMonitorSelect.ItemsSource = new[] { LocalizationService.T("MonitorNone") };
             CmbMonitorSelect.SelectedIndex = 0;
             RebuildMonitorPills();
+            TxtNoActiveSession.Text = LocalizationService.T("NoActiveSession");
             ViewerEmptyState.Visibility = Visibility.Visible;
         });
 
         try
         {
             BtnConnect.IsEnabled = false;
-            await _clientSession.ConnectAsync(
+            await _clientSession.ConnectDualAuthAsync(
                 target,
                 s.RelayUrl,
                 _lanDiscovery.CurrentDevices,
-                async (hostName, allowUnattended) =>
-                {
-                    if (!string.IsNullOrWhiteSpace(savedSecret) && !usedSavedSecret)
-                    {
-                        usedSavedSecret = true;
-                        lastEnteredSecret = savedSecret;
-                        return savedSecret;
-                    }
-                    lastEnteredSecret = await PromptOutgoingAuthAsync(hostName, allowUnattended, savedEntry?.Alias ?? target).ConfigureAwait(false);
-                    return lastEnteredSecret;
-                },
+                savedSecret,
+                ctx => ShowDualAuthModalAsync(ctx, savedEntry?.Alias ?? target),
                 s.ConnectionMethodIndex);
 
             _audioEnabled = _clientSession.IsAudioEnabled;
             TxtBtnAudio.Text = $"{LocalizationService.T("AudioToggle")}: {(_audioEnabled ? LocalizationService.T("StateOn") : LocalizationService.T("StateOff"))}";
 
-            if (_lastAuthRemember || (!string.IsNullOrWhiteSpace(lastEnteredSecret) && !usedSavedSecret && _lastAuthRemember))
+            if (_lastAuthRemember && !string.IsNullOrWhiteSpace(_lastAuthEnteredSecret))
             {
-                App.Settings.UpsertSavedConnection(target, _lastAuthAlias, lastEnteredSecret, _clientSession.RemoteStormId);
+                App.Settings.UpsertSavedConnection(target, _lastAuthAlias, _lastAuthEnteredSecret, _clientSession.RemoteStormId);
                 RefreshAddressBookGrid();
             }
-            else if (usedSavedSecret && savedEntry is not null)
+            else if (hasSavedSecret && savedEntry is not null && string.IsNullOrEmpty(_lastAuthEnteredSecret))
             {
                 savedEntry.LastConnectedUtc = DateTime.UtcNow;
                 App.Settings.Save();
@@ -621,12 +614,18 @@ public partial class MainWindow : Window
 
             App.Settings.AddAudit(target, _clientSession.Telemetry.Mode.ToString(), "OutgoingConnected");
             RefreshAuditGrid();
+            if (_clientSession.FramesReceivedCount == 0)
+            {
+                TxtNoActiveSession.Text = LocalizationService.T("StatusWaitingVideo");
+            }
             NavViewer.IsChecked = true;
             RemoteViewportHost.Focus();
             _ = _clientSession.RequestFileListAsync("");
         }
         catch (Exception ex)
         {
+            ModalAuth.Visibility = Visibility.Collapsed;
+            _activeDualAuth = null;
             TxtConnectStatus.Text = $"{LocalizationService.T("StatusConnFailed")}: {ex.Message}";
         }
         finally
@@ -635,7 +634,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private Task<ConsentDecisionPayload> PromptHostConsentAsync(IncomingConsentRequest req)
+    private Task<ConsentDecisionPayload> PromptHostConsentAsync(IncomingConsentRequest req, CancellationToken ct)
     {
         return Dispatcher.InvokeAsync(() =>
         {
@@ -644,31 +643,63 @@ public partial class MainWindow : Window
             Activate();
 
             _consentTcs?.TrySetResult(new ConsentDecisionPayload(false, req.ProposedPermissions));
-            _consentTcs = new TaskCompletionSource<ConsentDecisionPayload>();
+            var tcs = new TaskCompletionSource<ConsentDecisionPayload>();
+            _consentTcs = tcs;
 
-            TxtConsentDetails.Text = $"{req.ClientName} ({DeviceIdentity.FormatId(req.ClientStormId)})\n{req.RemoteEndpoint} [{req.Mode}]";
+            TxtConsentDetails.Text = $"{req.ClientName} ({DeviceIdentity.FormatId(req.ClientStormId)})\n{req.RemoteEndpoint} [{LocalizationService.LocalizeMode(req.Mode)}]";
             ChkConsentControl.IsChecked = req.ProposedPermissions.AllowControl;
             ChkConsentClipboard.IsChecked = req.ProposedPermissions.AllowClipboard;
             ChkConsentFiles.IsChecked = req.ProposedPermissions.AllowFileTransfer;
             ChkConsentAudio.IsChecked = req.ProposedPermissions.AllowAudio;
             ModalConsent.Visibility = Visibility.Visible;
-            return _consentTcs.Task;
+
+            ct.Register(() => Dispatcher.BeginInvoke(() =>
+            {
+                if (ReferenceEquals(_consentTcs, tcs) && ModalConsent.Visibility == Visibility.Visible)
+                {
+                    ModalConsent.Visibility = Visibility.Collapsed;
+                }
+                tcs.TrySetResult(new ConsentDecisionPayload(false, req.ProposedPermissions));
+            }));
+
+            return tcs.Task;
         }).Task.Unwrap();
     }
 
-    private Task<string?> PromptOutgoingAuthAsync(string hostName, bool allowUnattended, string suggestedAlias)
+    private Task ShowDualAuthModalAsync(DualAuthContext ctx, string suggestedAlias)
     {
         return Dispatcher.InvokeAsync(() =>
         {
-            _authTcs?.TrySetResult(null);
-            _authTcs = new TaskCompletionSource<string?>();
+            _activeDualAuth = ctx;
+            TxtAuthError.Text = string.Empty;
+            TxtAuthError.Visibility = Visibility.Collapsed;
             PwdRemoteAuth.Password = string.Empty;
-            ChkRememberConnection.IsChecked = true;
-            TxtRememberAlias.Text = !string.IsNullOrWhiteSpace(hostName) ? hostName : suggestedAlias;
+            ChkRememberConnection.IsChecked = false;
+            TxtRememberAlias.Text = !string.IsNullOrWhiteSpace(ctx.HostName) ? ctx.HostName : suggestedAlias;
+            BtnAuthOk.IsEnabled = true;
             ModalAuth.Visibility = Visibility.Visible;
             PwdRemoteAuth.Focus();
-            return _authTcs.Task;
-        }).Task.Unwrap();
+
+            ctx.ErrorReceived += err => Dispatcher.BeginInvoke(() =>
+            {
+                if (!ReferenceEquals(_activeDualAuth, ctx)) return;
+                TxtAuthError.Text = err;
+                TxtAuthError.Visibility = Visibility.Visible;
+                BtnAuthOk.IsEnabled = true;
+                PwdRemoteAuth.Password = string.Empty;
+                PwdRemoteAuth.Focus();
+            });
+
+            ctx.CompletedToken.Register(() => Dispatcher.BeginInvoke(() =>
+            {
+                if (ReferenceEquals(_activeDualAuth, ctx))
+                {
+                    ModalAuth.Visibility = Visibility.Collapsed;
+                    _activeDualAuth = null;
+                    BtnAuthOk.IsEnabled = true;
+                }
+            }));
+        }).Task;
     }
 
     #region Header, Navigation & Modals
@@ -713,7 +744,8 @@ public partial class MainWindow : Window
             if (ModalAuth.Visibility == Visibility.Visible)
             {
                 ModalAuth.Visibility = Visibility.Collapsed;
-                _authTcs?.TrySetResult(null);
+                _activeDualAuth?.CancelAuth();
+                _activeDualAuth = null;
                 e.Handled = true;
                 return;
             }
@@ -923,16 +955,21 @@ public partial class MainWindow : Window
 
     private void BtnAuthOk_Click(object sender, RoutedEventArgs e)
     {
+        string secret = PwdRemoteAuth.Password;
+        if (string.IsNullOrWhiteSpace(secret) || _activeDualAuth is null) return;
         _lastAuthRemember = ChkRememberConnection.IsChecked == true;
         _lastAuthAlias = TxtRememberAlias.Text.Trim();
-        ModalAuth.Visibility = Visibility.Collapsed;
-        _authTcs?.TrySetResult(PwdRemoteAuth.Password);
+        _lastAuthEnteredSecret = secret;
+        TxtAuthError.Visibility = Visibility.Collapsed;
+        BtnAuthOk.IsEnabled = false;
+        _ = _activeDualAuth.SubmitSecretAsync(secret);
     }
 
     private void BtnAuthCancel_Click(object sender, RoutedEventArgs e)
     {
         ModalAuth.Visibility = Visibility.Collapsed;
-        _authTcs?.TrySetResult(null);
+        _activeDualAuth?.CancelAuth();
+        _activeDualAuth = null;
     }
 
     private void PwdRemoteAuth_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)

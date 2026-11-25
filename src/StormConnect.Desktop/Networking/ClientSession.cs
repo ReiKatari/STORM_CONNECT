@@ -27,6 +27,17 @@ public sealed record FileTransferProgress(
     string? Error
 );
 
+public sealed class DualAuthContext
+{
+    public required string HostName { get; init; }
+    public required bool AllowUnattended { get; init; }
+    public required Func<string, Task> SubmitSecretAsync { get; init; }
+    public required Action CancelAuth { get; init; }
+    public required CancellationToken CompletedToken { get; init; }
+    public event Action<string>? ErrorReceived;
+    internal void RaiseError(string message) => ErrorReceived?.Invoke(message);
+}
+
 /// <summary>
 /// Remote viewer & controller session connecting via Direct TCP/LAN or WSS Relay,
 /// performing ECDH P-256 + AES-256-GCM handshake and rendering 60 FPS video directly into WPF WriteableBitmap.
@@ -81,13 +92,54 @@ public sealed class ClientSession : IAsyncDisposable
         _clipboard.LocalClipboardChanged += OnLocalClipboardChanged;
     }
 
-    public async Task ConnectAsync(
+    public Task ConnectAsync(
         string targetInput,
         string relayUrl,
         IReadOnlyList<DiscoveredDevice> lanDevices,
         Func<string, bool, Task<string?>> promptPasswordOrPin,
         int preferredMethodIndex = 0, // 0=Auto, 1=DirectOnly, 2=InviteCode, 3=RelayOnly
         CancellationToken ct = default)
+    {
+        return ConnectDualAuthCoreAsync(
+            targetInput,
+            relayUrl,
+            lanDevices,
+            savedSecret: null,
+            legacyPromptBeforeSend: promptPasswordOrPin,
+            onInteractiveAuthNeeded: _ => Task.CompletedTask,
+            preferredMethodIndex,
+            ct);
+    }
+
+    public Task ConnectDualAuthAsync(
+        string targetInput,
+        string relayUrl,
+        IReadOnlyList<DiscoveredDevice> lanDevices,
+        string? savedSecret,
+        Func<DualAuthContext, Task> onInteractiveAuthNeeded,
+        int preferredMethodIndex = 0,
+        CancellationToken ct = default)
+    {
+        return ConnectDualAuthCoreAsync(
+            targetInput,
+            relayUrl,
+            lanDevices,
+            savedSecret,
+            legacyPromptBeforeSend: null,
+            onInteractiveAuthNeeded,
+            preferredMethodIndex,
+            ct);
+    }
+
+    private async Task ConnectDualAuthCoreAsync(
+        string targetInput,
+        string relayUrl,
+        IReadOnlyList<DiscoveredDevice> lanDevices,
+        string? savedSecret,
+        Func<string, bool, Task<string?>>? legacyPromptBeforeSend,
+        Func<DualAuthContext, Task> onInteractiveAuthNeeded,
+        int preferredMethodIndex,
+        CancellationToken ct)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var token = _cts.Token;
@@ -180,43 +232,84 @@ public sealed class ClientSession : IAsyncDisposable
         var chal = FrameCodec.DeserializeJson<AuthChallengePayload>(chalPkt.Payload)
             ?? throw new IOException(Services.LocalizationService.T("StatusInvalidChallenge"));
 
-        string? secret = await promptPasswordOrPin(RemoteHostName, chal.AllowUnattended).ConfigureAwait(false);
-        AuthMode mode = AuthMode.PinOrConsent;
-        string? proof = null;
-
-        if (!string.IsNullOrWhiteSpace(secret))
+        async Task SendAuthAsync(string? sec)
         {
-            mode = chal.AllowUnattended ? AuthMode.UnattendedPassword : AuthMode.PinOrConsent;
-            proof = CryptoSession.ComputeChallengeProof(secret, chal.Salt, chal.NonceChallenge);
+            AuthMode m = AuthMode.PinOrConsent;
+            string? p = null;
+            if (!string.IsNullOrWhiteSpace(sec))
+            {
+                m = chal.AllowUnattended ? AuthMode.UnattendedPassword : AuthMode.PinOrConsent;
+                p = CryptoSession.ComputeChallengeProof(sec, chal.Salt, chal.NonceChallenge);
+            }
+            var req = new AuthRequestPayload(_localStormId, Environment.MachineName, m, p, null);
+            await _channel.SendPacketAsync(PacketType.AuthRequest, FrameCodec.SerializeJson(req), ct: token).ConfigureAwait(false);
         }
 
-        var authReq = new AuthRequestPayload(_localStormId, Environment.MachineName, mode, proof, null);
-        await _channel.SendPacketAsync(PacketType.AuthRequest, FrameCodec.SerializeJson(authReq), ct: token).ConfigureAwait(false);
-
-        while (true)
+        if (legacyPromptBeforeSend is not null)
         {
-            var respPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
-            if (respPkt is null) throw new IOException(Services.LocalizationService.T("StatusClosedBeforeAuth"));
-            if (respPkt.Type != PacketType.AuthResponse) continue;
+            savedSecret = await legacyPromptBeforeSend(RemoteHostName, chal.AllowUnattended).ConfigureAwait(false);
+        }
 
-            var resp = FrameCodec.DeserializeJson<AuthResponsePayload>(respPkt.Payload);
-            if (resp is null) throw new IOException(Services.LocalizationService.T("StatusInvalidAuthResp"));
-            if (resp.PendingConsent)
+        // Send initial AuthRequest (saved unattended password if any, or null to open Host Consent + Client PIN simultaneously)
+        await SendAuthAsync(savedSecret).ConfigureAwait(false);
+
+        using var authDoneCts = CancellationTokenSource.CreateLinkedTokenSource(token);
+        DualAuthContext? dualCtx = null;
+        bool interactiveStarted = false;
+
+        try
+        {
+            while (true)
             {
-                StatusChanged?.Invoke(Services.LocalizationService.T("StatusWaitingConsent"));
-                continue;
-            }
-            if (!resp.Accepted)
-                throw new UnauthorizedAccessException(resp.Reason);
+                var respPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
+                if (respPkt is null) throw new IOException(Services.LocalizationService.T("StatusClosedBeforeAuth"));
+                if (respPkt.Type != PacketType.AuthResponse) continue;
 
-            GrantedPermissions = resp.Permissions;
-            break;
+                var resp = FrameCodec.DeserializeJson<AuthResponsePayload>(respPkt.Payload);
+                if (resp is null) throw new IOException(Services.LocalizationService.T("StatusInvalidAuthResp"));
+                if (resp.PendingConsent)
+                {
+                    StatusChanged?.Invoke(Services.LocalizationService.T("StatusWaitingConsent"));
+                    if (!interactiveStarted)
+                    {
+                        interactiveStarted = true;
+                        dualCtx = new DualAuthContext
+                        {
+                            HostName = RemoteHostName,
+                            AllowUnattended = chal.AllowUnattended,
+                            SubmitSecretAsync = SendAuthAsync,
+                            CancelAuth = () => { try { _cts?.Cancel(); } catch { } },
+                            CompletedToken = authDoneCts.Token
+                        };
+                        _ = Task.Run(async () =>
+                        {
+                            try { await onInteractiveAuthNeeded(dualCtx).ConfigureAwait(false); }
+                            catch { }
+                        }, authDoneCts.Token);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(resp.Reason))
+                    {
+                        dualCtx?.RaiseError(resp.Reason);
+                    }
+                    continue;
+                }
+                if (!resp.Accepted)
+                    throw new UnauthorizedAccessException(resp.Reason);
+
+                GrantedPermissions = resp.Permissions;
+                break;
+            }
+        }
+        finally
+        {
+            await authDoneCts.CancelAsync().ConfigureAwait(false);
         }
 
         _audioEnabled = _channel.Mode != ConnectionMode.WssRelay;
         if (GrantedPermissions.AllowAudio && _audioEnabled)
             _audio.StartPlayback();
 
+        Services.SessionLogger.Log("CLIENT", $"Authenticated to {RemoteHostName} via {_channel.Mode}");
         StatusChanged?.Invoke(string.Format(Services.LocalizationService.T("StatusConnectedTo"), RemoteHostName));
         _ = Task.Run(() => ReceiveLoopAsync(token), token);
         _ = Task.Run(() => PingLoopAsync(token), token);
@@ -608,6 +701,41 @@ public sealed class ClientSession : IAsyncDisposable
         }
     }
 
+    public static WriteableBitmap DecodeSlicesIntoBitmap(WriteableBitmap? existing, int frameW, int frameH, List<VideoTileRect> rects)
+    {
+        var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
+        foreach (var r in rects)
+        {
+            using var ms = new MemoryStream(r.JpegBytes, writable: false);
+            var decoder = new JpegBitmapDecoder(ms, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+            BitmapSource src = decoder.Frames[0];
+            if (src.Format != PixelFormats.Bgra32)
+            {
+                src = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
+            }
+            int w = src.PixelWidth;
+            int h = src.PixelHeight;
+            int stride = w * 4;
+            var px = new byte[stride * h];
+            src.CopyPixels(px, stride, 0);
+            decoded.Add((r.X, r.Y, w, h, stride, px));
+        }
+
+        if (existing is null || existing.PixelWidth != frameW || existing.PixelHeight != frameH)
+        {
+            existing = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
+        }
+
+        foreach (var d in decoded)
+        {
+            int copyW = Math.Min(d.W, frameW - d.X);
+            int copyH = Math.Min(d.H, frameH - d.Y);
+            if (copyW <= 0 || copyH <= 0 || d.X < 0 || d.Y < 0) continue;
+            existing.WritePixels(new Int32Rect(0, 0, copyW, copyH), d.Bgra, d.Stride, d.X, d.Y);
+        }
+        return existing;
+    }
+
     private void ApplyVideoUpdate(int frameW, int frameH, List<VideoTileRect> rects)
     {
         var disp = System.Windows.Application.Current?.Dispatcher;
@@ -615,54 +743,56 @@ public sealed class ClientSession : IAsyncDisposable
 
         try
         {
-            // Decode JPEG slices into raw BGRA arrays off the UI thread for buttery smooth rendering
+            // Decode JPEG slices via native WPF WIC JpegBitmapDecoder off the UI thread
             var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
             foreach (var r in rects)
             {
-                using var ms = new MemoryStream(r.JpegBytes);
-                using var bmp = new Bitmap(ms);
-                var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-                try
+                using var ms = new MemoryStream(r.JpegBytes, writable: false);
+                var decoder = new JpegBitmapDecoder(ms, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
+                BitmapSource src = decoder.Frames[0];
+                if (src.Format != PixelFormats.Bgra32)
                 {
-                    var px = new byte[bd.Stride * bmp.Height];
-                    System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, px, 0, px.Length);
-                    decoded.Add((r.X, r.Y, bmp.Width, bmp.Height, bd.Stride, px));
+                    src = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
                 }
-                finally
-                {
-                    bmp.UnlockBits(bd);
-                }
+                int w = src.PixelWidth;
+                int h = src.PixelHeight;
+                int stride = w * 4;
+                var px = new byte[stride * h];
+                src.CopyPixels(px, stride, 0);
+                decoded.Add((r.X, r.Y, w, h, stride, px));
             }
 
             disp.BeginInvoke(() =>
             {
-                lock (_bmpLock)
+                try
                 {
-                    if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
+                    lock (_bmpLock)
                     {
-                        _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
-                    }
+                        if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
+                        {
+                            _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
+                        }
 
-                    _bitmap.Lock();
-                    try
-                    {
                         foreach (var d in decoded)
                         {
                             int copyW = Math.Min(d.W, frameW - d.X);
                             int copyH = Math.Min(d.H, frameH - d.Y);
                             if (copyW <= 0 || copyH <= 0 || d.X < 0 || d.Y < 0) continue;
-                            _bitmap.WritePixels(new Int32Rect(d.X, d.Y, copyW, copyH), d.Bgra, d.Stride, 0);
+                            _bitmap.WritePixels(new Int32Rect(0, 0, copyW, copyH), d.Bgra, d.Stride, d.X, d.Y);
                         }
                     }
-                    finally
-                    {
-                        _bitmap.Unlock();
-                    }
+                    FrameUpdated?.Invoke(_bitmap);
                 }
-                FrameUpdated?.Invoke(_bitmap);
+                catch (Exception ex)
+                {
+                    Services.SessionLogger.Log("CLIENT", $"UI WritePixels error: {ex.Message}");
+                }
             });
         }
-        catch { }
+        catch (Exception ex)
+        {
+            Services.SessionLogger.Log("CLIENT", $"JPEG WIC decode error: {ex.Message}");
+        }
     }
 
     private async Task PingLoopAsync(CancellationToken ct)

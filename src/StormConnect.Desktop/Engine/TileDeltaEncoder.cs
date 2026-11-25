@@ -37,6 +37,38 @@ public sealed class TileDeltaEncoder
         _prevHeight = 0;
     }
 
+    public EncodedVideoUpdate? EncodeWithSizeBudget(CapturedFrame frame, int jpegQuality, bool forceFullFrame, int maxWidth, int maxPacketBytes)
+    {
+        var upd = Encode(frame, jpegQuality, forceFullFrame, maxWidth);
+        if (upd is null || maxPacketBytes <= 0) return upd;
+
+        if (EstimateWireSize(upd) <= maxPacketBytes)
+            return upd;
+
+        int[] tryQualities = [Math.Min(jpegQuality, 42), 30, 22];
+        int[] tryWidths = [maxWidth > 0 ? maxWidth : frame.Width, Math.Min(maxWidth > 0 ? maxWidth : frame.Width, 960)];
+
+        foreach (int w in tryWidths)
+        {
+            foreach (int q in tryQualities)
+            {
+                Reset();
+                var candidate = Encode(frame, q, forceFullFrame: upd.IsFullFrame, w);
+                if (candidate is not null && EstimateWireSize(candidate) <= maxPacketBytes)
+                    return candidate;
+                if (candidate is not null) upd = candidate;
+            }
+        }
+        return upd;
+    }
+
+    private static int EstimateWireSize(EncodedVideoUpdate upd)
+    {
+        int len = 10;
+        foreach (var r in upd.Rects) len += 20 + r.JpegBytes.Length;
+        return len;
+    }
+
     public EncodedVideoUpdate? Encode(CapturedFrame frame, int jpegQuality, bool forceFullFrame = false, int maxWidth = 0)
     {
         if (maxWidth > 0 && frame.Width > maxWidth)
@@ -119,7 +151,8 @@ public sealed class TileDeltaEncoder
         }
 
         var encodedTiles = new VideoTileRect[rects.Count];
-        Parallel.For(0, rects.Count, i =>
+        var popts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 4) };
+        Parallel.For(0, rects.Count, popts, i =>
         {
             var r = rects[i];
             var jpg = EncodeRegionJpeg(frame.BgraPixels, w, h, frame.Stride, r.X, r.Y, r.Width, r.Height, jpegQuality);

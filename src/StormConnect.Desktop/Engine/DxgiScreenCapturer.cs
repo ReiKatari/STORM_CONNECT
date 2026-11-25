@@ -31,6 +31,7 @@ public sealed class DxgiScreenCapturer : IDisposable
     private int _dupWidth;
     private int _dupHeight;
     private bool _dxgiDisabled;
+    private string _attachedDesktopName = string.Empty;
     private readonly object _lock = new();
 
     public static List<MonitorInfo> GetMonitors()
@@ -75,48 +76,57 @@ public sealed class DxgiScreenCapturer : IDisposable
         return screens[0].Bounds;
     }
 
-    public CapturedFrame? Capture(int monitorIndex)
+    public CapturedFrame? Capture(int monitorIndex, int maxWidth = 0)
     {
         lock (_lock)
         {
+            EnsureInputDesktop();
             var bounds = GetTargetBounds(monitorIndex);
             byte[]? pixels = null;
+            int outW = bounds.Width;
+            int outH = bounds.Height;
 
             if (monitorIndex >= 0 && !_dxgiDisabled)
             {
-                pixels = TryCaptureDxgi(monitorIndex, bounds.Width, bounds.Height);
+                pixels = TryCaptureDxgi(monitorIndex, bounds);
             }
 
-            pixels ??= CaptureGdiBitBlt(bounds);
-            if (pixels is null) return null;
+            if (pixels is null)
+            {
+                var gdi = CaptureGdiBitBlt(bounds, maxWidth);
+                if (gdi is null) return null;
+                (pixels, outW, outH) = gdi.Value;
+            }
 
             // Read cursor position relative to active monitor bounds
             var ci = new CURSORINFO { cbSize = Marshal.SizeOf<CURSORINFO>() };
             bool cursorOk = GetCursorInfo(out ci) && (ci.flags & 0x00000001) != 0;
-            int cx = cursorOk ? ci.ptScreenPos.x - bounds.X : 0;
-            int cy = cursorOk ? ci.ptScreenPos.y - bounds.Y : 0;
+            int cx = cursorOk ? (int)Math.Round((ci.ptScreenPos.x - bounds.X) * ((double)outW / Math.Max(1, bounds.Width))) : 0;
+            int cy = cursorOk ? (int)Math.Round((ci.ptScreenPos.y - bounds.Y) * ((double)outH / Math.Max(1, bounds.Height))) : 0;
 
             return new CapturedFrame
             {
-                Width = bounds.Width,
-                Height = bounds.Height,
-                Stride = bounds.Width * 4,
+                Width = outW,
+                Height = outH,
+                Stride = outW * 4,
                 BgraPixels = pixels,
                 CursorX = cx,
                 CursorY = cy,
-                CursorVisible = cursorOk && cx >= 0 && cy >= 0 && cx < bounds.Width && cy < bounds.Height
+                CursorVisible = cursorOk && cx >= 0 && cy >= 0 && cx < outW && cy < outH
             };
         }
     }
 
-    private byte[]? TryCaptureDxgi(int monitorIndex, int expectedW, int expectedH)
+    private byte[]? TryCaptureDxgi(int monitorIndex, Rectangle bounds)
     {
+        int expectedW = bounds.Width;
+        int expectedH = bounds.Height;
         try
         {
             if (_dupMonitorIndex != monitorIndex || _duplication == IntPtr.Zero)
             {
                 ReleaseDxgi();
-                if (!InitDxgiDuplication(monitorIndex, expectedW, expectedH))
+                if (!InitDxgiDuplication(monitorIndex, bounds))
                 {
                     _dxgiDisabled = true;
                     return null;
@@ -137,6 +147,9 @@ public sealed class DxgiScreenCapturer : IDisposable
 
             try
             {
+                if (frameInfo.LastPresentTime == 0)
+                    return null;
+
                 Guid iidTex2D = new("6f15aaf2-d208-4e89-9ab4-489535d34f9c");
                 Marshal.QueryInterface(desktopResource, in iidTex2D, out IntPtr desktopTex);
                 if (desktopTex == IntPtr.Zero) return null;
@@ -186,9 +199,12 @@ public sealed class DxgiScreenCapturer : IDisposable
             finally
             {
                 Marshal.Release(desktopResource);
-                // IDXGIOutputDuplication::ReleaseFrame (vtable slot 14)
-                var releaseFrame = Marshal.GetDelegateForFunctionPointer<ReleaseFrameDelegate>(GetVtableSlot(_duplication, 14));
-                releaseFrame(_duplication);
+                if (_duplication != IntPtr.Zero)
+                {
+                    // IDXGIOutputDuplication::ReleaseFrame (vtable slot 14)
+                    var releaseFrame = Marshal.GetDelegateForFunctionPointer<ReleaseFrameDelegate>(GetVtableSlot(_duplication, 14));
+                    releaseFrame(_duplication);
+                }
             }
         }
         catch
@@ -199,8 +215,10 @@ public sealed class DxgiScreenCapturer : IDisposable
         }
     }
 
-    private bool InitDxgiDuplication(int monitorIndex, int w, int h)
+    private bool InitDxgiDuplication(int monitorIndex, Rectangle expectedBounds)
     {
+        int w = expectedBounds.Width;
+        int h = expectedBounds.Height;
         int[] featureLevels = [0xb100, 0xb000, 0xa100]; // 11.1, 11.0, 10.1
         int hr = D3D11CreateDevice(
             IntPtr.Zero,
@@ -224,13 +242,30 @@ public sealed class DxgiScreenCapturer : IDisposable
             if (getAdapter(dxgiDevice, out IntPtr adapter) != 0 || adapter == IntPtr.Zero) return false;
             try
             {
-                // IDXGIAdapter::EnumOutputs (vtable slot 7)
+                // Enumerate DXGI outputs and match DesktopCoordinates against expectedBounds (never rely on index parity!)
                 var enumOutputs = Marshal.GetDelegateForFunctionPointer<EnumOutputsDelegate>(GetVtableSlot(adapter, 7));
-                if (enumOutputs(adapter, (uint)monitorIndex, out IntPtr output) != 0 || output == IntPtr.Zero) return false;
+                IntPtr matchedOutput = IntPtr.Zero;
+                for (uint idx = 0; idx < 8; idx++)
+                {
+                    if (enumOutputs(adapter, idx, out IntPtr candidate) != 0 || candidate == IntPtr.Zero) break;
+                    var getOutDesc = Marshal.GetDelegateForFunctionPointer<GetOutputDescDelegate>(GetVtableSlot(candidate, 7));
+                    if (getOutDesc(candidate, out var odesc) == 0 &&
+                        odesc.DesktopCoordinates.Left == expectedBounds.Left &&
+                        odesc.DesktopCoordinates.Top == expectedBounds.Top &&
+                        odesc.DesktopCoordinates.Right == expectedBounds.Right &&
+                        odesc.DesktopCoordinates.Bottom == expectedBounds.Bottom)
+                    {
+                        matchedOutput = candidate;
+                        break;
+                    }
+                    Marshal.Release(candidate);
+                }
+                if (matchedOutput == IntPtr.Zero) return false;
+
                 try
                 {
                     Guid iidOutput1 = new("00cddea8-939b-4b83-a340-a685226666cc");
-                    if (Marshal.QueryInterface(output, in iidOutput1, out IntPtr output1) != 0) return false;
+                    if (Marshal.QueryInterface(matchedOutput, in iidOutput1, out IntPtr output1) != 0) return false;
                     try
                     {
                         // IDXGIOutput1::DuplicateOutput (vtable slot 22)
@@ -261,40 +296,89 @@ public sealed class DxgiScreenCapturer : IDisposable
                     }
                     finally { Marshal.Release(output1); }
                 }
-                finally { Marshal.Release(output); }
+                finally { Marshal.Release(matchedOutput); }
             }
             finally { Marshal.Release(adapter); }
         }
         finally { Marshal.Release(dxgiDevice); }
     }
 
-    private static byte[]? CaptureGdiBitBlt(Rectangle bounds)
+    private static (byte[] Pixels, int Width, int Height)? CaptureGdiBitBlt(Rectangle bounds, int maxWidth)
     {
         try
         {
-            using var bmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
+            bool scaled = maxWidth > 0 && bounds.Width > maxWidth;
+            int dstW = scaled ? Math.Max(64, maxWidth & ~1) : bounds.Width;
+            int dstH = scaled ? Math.Max(64, ((int)Math.Round(bounds.Height * ((double)dstW / bounds.Width))) & ~1) : bounds.Height;
+
+            using var bmp = new Bitmap(dstW, dstH, PixelFormat.Format32bppArgb);
+            bool copied = false;
             using (var g = Graphics.FromImage(bmp))
             {
                 IntPtr hdcDst = g.GetHdc();
-                IntPtr hdcSrc = GetDC(IntPtr.Zero);
                 try
                 {
-                    BitBlt(hdcDst, 0, 0, bounds.Width, bounds.Height, hdcSrc, bounds.X, bounds.Y, 0x00CC0020 | 0x40000000);
+                    IntPtr hdcSrc = GetDC(IntPtr.Zero);
+                    try
+                    {
+                        if (scaled)
+                        {
+                            SetStretchBltMode(hdcDst, 4 /* HALFTONE */);
+                            copied = StretchBlt(hdcDst, 0, 0, dstW, dstH, hdcSrc, bounds.X, bounds.Y, bounds.Width, bounds.Height, 0x00CC0020 | 0x40000000);
+                            if (!copied)
+                                copied = StretchBlt(hdcDst, 0, 0, dstW, dstH, hdcSrc, bounds.X, bounds.Y, bounds.Width, bounds.Height, 0x00CC0020);
+                        }
+                        else
+                        {
+                            copied = BitBlt(hdcDst, 0, 0, dstW, dstH, hdcSrc, bounds.X, bounds.Y, 0x00CC0020 | 0x40000000);
+                            if (!copied)
+                                copied = BitBlt(hdcDst, 0, 0, dstW, dstH, hdcSrc, bounds.X, bounds.Y, 0x00CC0020);
+                        }
+                    }
+                    finally
+                    {
+                        ReleaseDC(IntPtr.Zero, hdcSrc);
+                    }
+
+                    if (!copied)
+                    {
+                        IntPtr displayDc = CreateDC("DISPLAY", null, null, IntPtr.Zero);
+                        if (displayDc != IntPtr.Zero)
+                        {
+                            try
+                            {
+                                if (scaled)
+                                {
+                                    SetStretchBltMode(hdcDst, 4);
+                                    copied = StretchBlt(hdcDst, 0, 0, dstW, dstH, displayDc, bounds.X, bounds.Y, bounds.Width, bounds.Height, 0x00CC0020);
+                                }
+                                else
+                                {
+                                    copied = BitBlt(hdcDst, 0, 0, dstW, dstH, displayDc, bounds.X, bounds.Y, 0x00CC0020);
+                                }
+                            }
+                            finally
+                            {
+                                DeleteDC(displayDc);
+                            }
+                        }
+                    }
                 }
                 finally
                 {
-                    ReleaseDC(IntPtr.Zero, hdcSrc);
                     g.ReleaseHdc(hdcDst);
                 }
             }
 
-            var bmpData = bmp.LockBits(new Rectangle(0, 0, bounds.Width, bounds.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            if (!copied) return null;
+
+            var bmpData = bmp.LockBits(new Rectangle(0, 0, dstW, dstH), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
             try
             {
-                int bytes = bmpData.Stride * bounds.Height;
+                int bytes = bmpData.Stride * dstH;
                 var pixels = new byte[bytes];
                 Marshal.Copy(bmpData.Scan0, pixels, 0, bytes);
-                return pixels;
+                return (pixels, dstW, dstH);
             }
             finally
             {
@@ -305,6 +389,45 @@ public sealed class DxgiScreenCapturer : IDisposable
         {
             return null;
         }
+    }
+
+    private void EnsureInputDesktop()
+    {
+        try
+        {
+            IntPtr hInput = OpenInputDesktop(0, false, 0x01FF);
+            if (hInput == IntPtr.Zero)
+                hInput = OpenInputDesktop(0, false, 0x0041 /* DESKTOP_READOBJECTS | DESKTOP_SWITCHDESKTOP */);
+            if (hInput == IntPtr.Zero) return;
+            try
+            {
+                string inputName = GetDesktopName(hInput);
+                string threadName = GetDesktopName(GetThreadDesktop(GetCurrentThreadId()));
+                if (!string.Equals(inputName, threadName, StringComparison.OrdinalIgnoreCase) ||
+                    !string.Equals(inputName, _attachedDesktopName, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (SetThreadDesktop(hInput))
+                    {
+                        _attachedDesktopName = inputName;
+                        ReleaseDxgi(); // re-bind DXGI output duplication to the new input desktop
+                    }
+                }
+            }
+            finally
+            {
+                CloseDesktop(hInput);
+            }
+        }
+        catch { }
+    }
+
+    private static string GetDesktopName(IntPtr hDesk)
+    {
+        if (hDesk == IntPtr.Zero) return string.Empty;
+        var buf = new byte[256];
+        if (GetUserObjectInformation(hDesk, 2 /* UOI_NAME */, buf, buf.Length, out int needed) && needed >= 2)
+            return System.Text.Encoding.Unicode.GetString(buf, 0, needed - 2).TrimEnd('\0');
+        return string.Empty;
     }
 
     private static IntPtr GetVtableSlot(IntPtr comPtr, int index)
@@ -331,10 +454,29 @@ public sealed class DxgiScreenCapturer : IDisposable
     [DllImport("user32.dll")] private static extern IntPtr GetDC(IntPtr hWnd);
     [DllImport("user32.dll")] private static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
     [DllImport("gdi32.dll")] private static extern bool BitBlt(IntPtr hdcDest, int xDest, int yDest, int w, int h, IntPtr hdcSrc, int xSrc, int ySrc, int rop);
+    [DllImport("gdi32.dll")] private static extern bool StretchBlt(IntPtr hdcDest, int xDest, int yDest, int wDest, int hDest, IntPtr hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc, int rop);
+    [DllImport("gdi32.dll")] private static extern int SetStretchBltMode(IntPtr hdc, int mode);
+    [DllImport("gdi32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr CreateDC(string lpszDriver, string? lpszDevice, string? lpszOutput, IntPtr lpInitData);
+    [DllImport("gdi32.dll")] private static extern bool DeleteDC(IntPtr hdc);
+    [DllImport("user32.dll", SetLastError = true)] private static extern IntPtr OpenInputDesktop(uint dwFlags, bool fInherit, uint dwDesiredAccess);
+    [DllImport("user32.dll", SetLastError = true)] private static extern bool SetThreadDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll")] private static extern bool CloseDesktop(IntPtr hDesktop);
+    [DllImport("user32.dll")] private static extern IntPtr GetThreadDesktop(uint dwThreadId);
+    [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern bool GetUserObjectInformation(IntPtr hObj, int nIndex, byte[] pvInfo, int nLength, out int lpnLengthNeeded);
     [DllImport("user32.dll")] private static extern bool GetCursorInfo(out CURSORINFO pci);
     [DllImport("d3d11.dll")] private static extern int D3D11CreateDevice(IntPtr pAdapter, int driverType, IntPtr software, uint flags, int[] pFeatureLevels, int featureLevels, uint sdkVersion, out IntPtr ppDevice, out int pFeatureLevel, out IntPtr ppImmediateContext);
 
     [StructLayout(LayoutKind.Sequential)] private struct POINT { public int x, y; }
+    [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] private struct DXGI_OUTPUT_DESC
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        public RECT DesktopCoordinates;
+        public int AttachedToDesktop;
+        public int Rotation;
+        public IntPtr Monitor;
+    }
     [StructLayout(LayoutKind.Sequential)] private struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT ptScreenPos; }
     [StructLayout(LayoutKind.Sequential)] private struct D3D11_TEXTURE2D_DESC { public uint Width, Height, MipLevels, ArraySize, Format, SampleCount, SampleQuality, Usage, BindFlags, CPUAccessFlags, MiscFlags; }
     [StructLayout(LayoutKind.Sequential)] private struct D3D11_MAPPED_SUBRESOURCE { public IntPtr pData; public int RowPitch; public int DepthPitch; }
@@ -342,6 +484,7 @@ public sealed class DxgiScreenCapturer : IDisposable
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetAdapterDelegate(IntPtr self, out IntPtr adapter);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int EnumOutputsDelegate(IntPtr self, uint idx, out IntPtr output);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int GetOutputDescDelegate(IntPtr self, out DXGI_OUTPUT_DESC desc);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int DuplicateOutputDelegate(IntPtr self, IntPtr device, out IntPtr dup);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int CreateTexture2DDelegate(IntPtr self, ref D3D11_TEXTURE2D_DESC desc, IntPtr initData, out IntPtr tex);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void GetTextureDescDelegate(IntPtr self, out D3D11_TEXTURE2D_DESC desc);

@@ -506,4 +506,223 @@ public sealed class ProtocolAndEngineTests
         var distinct = ThemeService.Fonts.Select(f => f.WpfFamily).Distinct(StringComparer.OrdinalIgnoreCase).Count();
         Assert.Equal(10, distinct);
     }
+
+    [Fact]
+    public void TileDeltaEncoder_SizeBudget_EnforcesAtomicWssLimit()
+    {
+        int w = 3840, h = 2160;
+        var px = new byte[w * h * 4];
+        var rng = new Random(123);
+        rng.NextBytes(px);
+        for (int i = 3; i < px.Length; i += 4) px[i] = 255;
+        var frame = new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px };
+
+        var enc = new TileDeltaEncoder();
+        var upd = enc.EncodeWithSizeBudget(frame, 55, forceFullFrame: true, maxWidth: 1280, maxPacketBytes: 54 * 1024);
+        Assert.NotNull(upd);
+        var wire = TileDeltaEncoder.SerializeVideoUpdate(upd!);
+        Assert.True(wire.Length <= 54 * 1024, $"Expected <= 54KB atomic frame, got {wire.Length} bytes");
+    }
+
+    [Fact]
+    public void WpfVideoDecoder_DecodesFullAndDeltaTileIntoWriteableBitmap()
+    {
+        Exception? staEx = null;
+        bool hasNonZero = false;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                int w = 256, h = 256;
+                var px1 = new byte[w * h * 4];
+                for (int i = 0; i < px1.Length; i += 4) { px1[i] = 20; px1[i + 1] = 120; px1[i + 2] = 220; px1[i + 3] = 255; }
+                var enc = new TileDeltaEncoder();
+                var u1 = enc.Encode(new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px1 }, 80, true)!;
+                var wb = ClientSession.DecodeSlicesIntoBitmap(null, u1.FrameWidth, u1.FrameHeight, u1.Rects);
+
+                var px2 = (byte[])px1.Clone();
+                for (int y = 0; y < 64; y++)
+                    for (int x = 64; x < 128; x++)
+                    {
+                        int off = (y * w + x) * 4;
+                        px2[off] = 250; px2[off + 1] = 240; px2[off + 2] = 10;
+                    }
+                var u2 = enc.Encode(new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px2 }, 80, false)!;
+                wb = ClientSession.DecodeSlicesIntoBitmap(wb, u2.FrameWidth, u2.FrameHeight, u2.Rects);
+
+                var outBuf = new byte[w * h * 4];
+                wb.CopyPixels(outBuf, w * 4, 0);
+                int sampleOff = (10 * w + 74) * 4;
+                hasNonZero = outBuf[sampleOff] > 200 && outBuf[sampleOff + 1] > 200;
+            }
+            catch (Exception ex) { staEx = ex; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        Assert.Null(staEx);
+        Assert.True(hasNonZero);
+    }
+
+    [Fact]
+    public async Task EndToEnd_DualAuth_HostConsentWinsWhileClientPromptOpen()
+    {
+        const string hostId = "911111222";
+        const string clientId = "911333444";
+        const string pin = "654321";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        var hostPromptShown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hostApproveTcs = new TaskCompletionSource<ConsentDecisionPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            async (req, ct) =>
+            {
+                hostPromptShown.TrySetResult();
+                using var _ = ct.Register(() => hostApproveTcs.TrySetResult(new ConsentDecisionPayload(false, req.ProposedPermissions)));
+                return await hostApproveTcs.Task.ConfigureAwait(false);
+            },
+            hostClip);
+
+        host.Start(0, "", enableRelay: false);
+        while (host.ListeningPort == 0) await Task.Delay(20);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        var clientPromptShown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clientClosedByHost = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var connTask = client.ConnectDualAuthAsync(
+            $"127.0.0.1:{host.ListeningPort}",
+            "",
+            Array.Empty<DiscoveredDevice>(),
+            savedSecret: null,
+            ctx =>
+            {
+                clientPromptShown.TrySetResult();
+                ctx.CompletedToken.Register(() => clientClosedByHost.TrySetResult());
+                return Task.CompletedTask;
+            });
+
+        await hostPromptShown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await clientPromptShown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        hostApproveTcs.TrySetResult(new ConsentDecisionPayload(true, new SessionPermissions()));
+        await connTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await clientClosedByHost.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.True(client.IsConnected);
+    }
+
+    [Fact]
+    public async Task EndToEnd_DualAuth_ClientPinWinsAndCancelsHostConsent()
+    {
+        const string hostId = "922111222";
+        const string clientId = "922333444";
+        const string pin = "789012";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        var hostPromptShown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hostPromptCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            async (req, ct) =>
+            {
+                hostPromptShown.TrySetResult();
+                var tcs = new TaskCompletionSource<ConsentDecisionPayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+                using var _ = ct.Register(() =>
+                {
+                    hostPromptCancelled.TrySetResult();
+                    tcs.TrySetResult(new ConsentDecisionPayload(false, req.ProposedPermissions));
+                });
+                return await tcs.Task.ConfigureAwait(false);
+            },
+            hostClip);
+
+        host.Start(0, "", enableRelay: false);
+        while (host.ListeningPort == 0) await Task.Delay(20);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        DualAuthContext? capturedCtx = null;
+        var clientPromptShown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var connTask = client.ConnectDualAuthAsync(
+            $"127.0.0.1:{host.ListeningPort}",
+            "",
+            Array.Empty<DiscoveredDevice>(),
+            savedSecret: null,
+            ctx =>
+            {
+                capturedCtx = ctx;
+                clientPromptShown.TrySetResult();
+                return Task.CompletedTask;
+            });
+
+        await hostPromptShown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await clientPromptShown.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Client submits wrong PIN first -> ErrorReceived, then submits correct PIN -> Host Consent cancels!
+        var errTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        capturedCtx!.ErrorReceived += e => errTcs.TrySetResult(e);
+        await capturedCtx.SubmitSecretAsync("000000");
+        await errTcs.Task.WaitAsync(TimeSpan.FromSeconds(4));
+
+        await capturedCtx.SubmitSecretAsync(pin);
+        await connTask.WaitAsync(TimeSpan.FromSeconds(5));
+        await hostPromptCancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.True(client.IsConnected);
+    }
+
+    [Fact]
+    public async Task EndToEnd_UnattendedPassword_InstantSilentLoginWithoutConsent()
+    {
+        const string hostId = "933111222";
+        const string clientId = "933333444";
+        const string unattPwd = "MyPermanentSecret!";
+        var salt = RandomNumberGenerator.GetBytes(16);
+        var hash = CryptoSession.HashPassword(unattPwd, salt);
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        bool consentTriggered = false;
+        bool clientModalTriggered = false;
+
+        await using var host = new HostServer(
+            hostId,
+            () => "111111",
+            () => (hash, salt),
+            () => new SessionPermissions(),
+            () => true,
+            (_, _) =>
+            {
+                consentTriggered = true;
+                return Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions()));
+            },
+            hostClip);
+
+        host.Start(0, "", enableRelay: false);
+        while (host.ListeningPort == 0) await Task.Delay(20);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        await client.ConnectDualAuthAsync(
+            $"127.0.0.1:{host.ListeningPort}",
+            "",
+            Array.Empty<DiscoveredDevice>(),
+            savedSecret: unattPwd,
+            _ => { clientModalTriggered = true; return Task.CompletedTask; });
+
+        Assert.True(client.IsConnected);
+        Assert.False(consentTriggered);
+        Assert.False(clientModalTriggered);
+    }
 }
