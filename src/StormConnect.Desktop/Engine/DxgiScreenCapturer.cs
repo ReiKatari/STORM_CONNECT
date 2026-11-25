@@ -226,41 +226,105 @@ public sealed class DxgiScreenCapturer : IDisposable
         }
     }
 
-    private static unsafe void DownscalePointerToBgra(IntPtr srcPtr, int srcPitch, int srcW, int srcH, byte[] dst, int dstW, int dstH)
+    public static void DownscalePointerToBgra(IntPtr srcPtr, int srcPitch, int srcW, int srcH, byte[] dst, int dstW, int dstH)
     {
-        byte* srcBase = (byte*)srcPtr;
-        bool boxFilter = srcW >= dstW * 2 && srcH >= dstH * 2;
-        fixed (byte* dstBase = dst)
+        var dstHandle = GCHandle.Alloc(dst, GCHandleType.Pinned);
+        try
         {
-            for (int y = 0; y < dstH; y++)
-            {
-                int sy0 = (int)((long)y * srcH / dstH);
-                int sy1 = boxFilter && sy0 + 1 < srcH ? sy0 + 1 : sy0;
-                byte* row0 = srcBase + sy0 * srcPitch;
-                byte* row1 = srcBase + sy1 * srcPitch;
-                uint* dstRow = (uint*)(dstBase + y * dstW * 4);
+            IntPtr dstPtr = dstHandle.AddrOfPinnedObject();
+            bool boxFilter = srcW >= dstW * 2 && srcH >= dstH * 2;
+            ulong xStep = dstW > 1 ? ((ulong)(srcW - 1) << 16) / (ulong)(dstW - 1) : 0;
+            ulong yStep = dstH > 1 ? ((ulong)(srcH - 1) << 16) / (ulong)(dstH - 1) : 0;
+            int dstStride = dstW * 4;
 
-                for (int x = 0; x < dstW; x++)
+            void ProcessRow(int y)
+            {
+                unsafe
                 {
-                    int sx0 = (int)((long)x * srcW / dstW);
-                    if (!boxFilter)
+                    byte* srcBase = (byte*)srcPtr;
+                    uint* dstRow = (uint*)((byte*)dstPtr + y * dstStride);
+
+                    if (boxFilter)
                     {
-                        dstRow[x] = *(uint*)(row0 + sx0 * 4);
+                        int sy0 = (int)((long)y * srcH / dstH);
+                        int sy1 = Math.Min(srcH, (int)((long)(y + 1) * srcH / dstH));
+                        if (sy1 <= sy0) sy1 = Math.Min(srcH, sy0 + 1);
+                        if (sy1 - sy0 > 4) sy1 = sy0 + 4;
+
+                        for (int x = 0; x < dstW; x++)
+                        {
+                            int sx0 = (int)((long)x * srcW / dstW);
+                            int sx1 = Math.Min(srcW, (int)((long)(x + 1) * srcW / dstW));
+                            if (sx1 <= sx0) sx1 = Math.Min(srcW, sx0 + 1);
+                            if (sx1 - sx0 > 4) sx1 = sx0 + 4;
+
+                            uint sb = 0, sg = 0, sr = 0, cnt = 0;
+                            for (int sy = sy0; sy < sy1; sy++)
+                            {
+                                byte* sRow = srcBase + sy * srcPitch + sx0 * 4;
+                                for (int sx = sx0; sx < sx1; sx++)
+                                {
+                                    sb += sRow[0];
+                                    sg += sRow[1];
+                                    sr += sRow[2];
+                                    sRow += 4;
+                                    cnt++;
+                                }
+                            }
+                            dstRow[x] = (sb / cnt) | ((sg / cnt) << 8) | ((sr / cnt) << 16) | 0xFF000000u;
+                        }
                     }
                     else
                     {
-                        int sx1 = sx0 + 1 < srcW ? sx0 + 1 : sx0;
-                        byte* p00 = row0 + sx0 * 4;
-                        byte* p01 = row0 + sx1 * 4;
-                        byte* p10 = row1 + sx0 * 4;
-                        byte* p11 = row1 + sx1 * 4;
-                        uint b = (uint)(p00[0] + p01[0] + p10[0] + p11[0]) >> 2;
-                        uint g = (uint)(p00[1] + p01[1] + p10[1] + p11[1]) >> 2;
-                        uint r = (uint)(p00[2] + p01[2] + p10[2] + p11[2]) >> 2;
-                        dstRow[x] = b | (g << 8) | (r << 16) | 0xFF000000u;
+                        ulong yAcc = (ulong)y * yStep;
+                        int sy0 = Math.Min(srcH - 1, (int)(yAcc >> 16));
+                        int sy1 = sy0 + 1 < srcH ? sy0 + 1 : sy0;
+                        uint wy8 = (uint)((yAcc & 0xFFFF) >> 8);
+                        uint invWy = 256u - wy8;
+                        byte* row0 = srcBase + sy0 * srcPitch;
+                        byte* row1 = srcBase + sy1 * srcPitch;
+
+                        ulong xAcc = 0;
+                        for (int x = 0; x < dstW; x++)
+                        {
+                            int sx0 = Math.Min(srcW - 1, (int)(xAcc >> 16));
+                            int sx1 = sx0 + 1 < srcW ? sx0 + 1 : sx0;
+                            uint wx8 = (uint)((xAcc & 0xFFFF) >> 8);
+                            uint invWx = 256u - wx8;
+                            xAcc += xStep;
+
+                            uint w00 = invWx * invWy;
+                            uint w01 = wx8 * invWy;
+                            uint w10 = invWx * wy8;
+                            uint w11 = wx8 * wy8;
+
+                            byte* p00 = row0 + sx0 * 4;
+                            byte* p01 = row0 + sx1 * 4;
+                            byte* p10 = row1 + sx0 * 4;
+                            byte* p11 = row1 + sx1 * 4;
+
+                            uint b = (p00[0] * w00 + p01[0] * w01 + p10[0] * w10 + p11[0] * w11 + 32768u) >> 16;
+                            uint g = (p00[1] * w00 + p01[1] * w01 + p10[1] * w10 + p11[1] * w11 + 32768u) >> 16;
+                            uint r = (p00[2] * w00 + p01[2] * w01 + p10[2] * w10 + p11[2] * w11 + 32768u) >> 16;
+                            dstRow[x] = b | (g << 8) | (r << 16) | 0xFF000000u;
+                        }
                     }
                 }
             }
+
+            if (dstH >= 480)
+            {
+                var popts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 4) };
+                Parallel.For(0, dstH, popts, ProcessRow);
+            }
+            else
+            {
+                for (int y = 0; y < dstH; y++) ProcessRow(y);
+            }
+        }
+        finally
+        {
+            dstHandle.Free();
         }
     }
 

@@ -979,4 +979,104 @@ public sealed class ProtocolAndEngineTests
         cts.Cancel();
         try { await Task.WhenAll(hostLoop, cliLoop); } catch { }
     }
+
+    [Fact]
+    public void TileDeltaEncoder_64pxStrips_FastCrisp1440x810WithLowStripCount()
+    {
+        int w = 3840, h = 2160;
+        var px = new byte[w * h * 4];
+        for (int y = 0; y < h; y++)
+        {
+            byte bg = (byte)(20 + (y * 80 / h));
+            for (int x = 0; x < w; x++)
+            {
+                int off = (y * w + x) * 4;
+                bool card = x > 300 && x < 1700 && y > 220 && y < 1600;
+                px[off] = card ? (byte)45 : bg;
+                px[off + 1] = card ? (byte)35 : (byte)(bg + 10);
+                px[off + 2] = card ? (byte)165 : (byte)(25 + (x * 60 / w));
+                px[off + 3] = 255;
+            }
+        }
+        var frame = new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px };
+        var enc = new TileDeltaEncoder();
+
+        // Warm JIT once, then measure timed crisp 1440x810 encode
+        _ = enc.EncodeAtomicPackets(frame, 68, forceFullFrame: true, maxWidth: 1440, maxPacketBytes: 10_500);
+        enc.Reset();
+
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        var packets = enc.EncodeAtomicPackets(frame, 68, forceFullFrame: true, maxWidth: 1440, maxPacketBytes: 10_500);
+        sw.Stop();
+
+        Assert.True(sw.ElapsedMilliseconds < 150, $"Expected fast <150ms encode for 1440x810, got {sw.ElapsedMilliseconds}ms");
+        Assert.InRange(packets.Count, 8, 22);
+        foreach (var p in packets)
+        {
+            Assert.Equal(1440, p.FrameWidth);
+            Assert.Equal(810, p.FrameHeight);
+            var wire = TileDeltaEncoder.SerializeVideoUpdate(p);
+            Assert.True(wire.Length <= 10_500, $"Strip exceeded 10.5 KB: {wire.Length} bytes");
+        }
+
+        Exception? staEx = null;
+        long nonBlack = 0;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                System.Windows.Media.Imaging.WriteableBitmap? wb = null;
+                foreach (var p in packets)
+                    wb = ClientSession.DecodeSlicesIntoBitmap(wb, p.FrameWidth, p.FrameHeight, p.Rects);
+                var buf = new byte[1440 * 810 * 4];
+                wb!.CopyPixels(buf, 1440 * 4, 0);
+                for (int i = 0; i < buf.Length; i += 4)
+                    if (buf[i] > 10 || buf[i + 1] > 10 || buf[i + 2] > 10) nonBlack++;
+            }
+            catch (Exception ex) { staEx = ex; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        Assert.Null(staEx);
+        Assert.Equal(1440 * 810, nonBlack);
+    }
+
+    [Fact]
+    public unsafe void TileDeltaEncoder_BilinearDownscale_1080pTo1440x810_PreservesSmoothGradient()
+    {
+        int srcW = 1920, srcH = 1080;
+        int dstW = 1440, dstH = 810;
+        var src = new byte[srcW * srcH * 4];
+        for (int y = 0; y < srcH; y++)
+        {
+            for (int x = 0; x < srcW; x++)
+            {
+                int off = (y * srcW + x) * 4;
+                byte val = (byte)(x * 255 / (srcW - 1));
+                src[off] = val;
+                src[off + 1] = val;
+                src[off + 2] = val;
+                src[off + 3] = 255;
+            }
+        }
+
+        var dst = new byte[dstW * dstH * 4];
+        fixed (byte* pSrc = src)
+        {
+            DxgiScreenCapturer.DownscalePointerToBgra((IntPtr)pSrc, srcW * 4, srcW, srcH, dst, dstW, dstH);
+        }
+
+        // Row 100 across X must be monotonically non-decreasing with max step <= 1 (smooth bilinear, zero gaps)
+        int prev = dst[(100 * dstW) * 4];
+        int maxStep = 0;
+        for (int x = 1; x < dstW; x++)
+        {
+            int cur = dst[(100 * dstW + x) * 4];
+            Assert.True(cur >= prev, $"Gradient inverted at x={x}: {prev} -> {cur}");
+            maxStep = Math.Max(maxStep, cur - prev);
+            prev = cur;
+        }
+        Assert.True(maxStep <= 1, $"Expected smooth gradient step <= 1, got {maxStep}");
+    }
 }

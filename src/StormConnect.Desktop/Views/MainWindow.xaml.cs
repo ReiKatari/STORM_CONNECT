@@ -567,6 +567,7 @@ public partial class MainWindow : Window
             BadgeMbps.Text = $"{tel.BandwidthMbps:0.##} {LocalizationService.T("UnitMbps")}";
             BadgeSavings.Text = $"{LocalizationService.T("LabelDelta")}: {tel.TileSavingsPercent:0.#}%";
             TxtViewerHud.Text = $"{LocalizationService.LocalizeMode(tel.Mode)} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} {LocalizationService.T("LabelFps")} | {tel.RttMs} {LocalizationService.T("UnitMs")}";
+            TxtFullscreenHud.Text = TxtViewerHud.Text;
             TelemetryChart.PushSample(tel.Fps, tel.BandwidthMbps);
             if (_clientSession is not null && _clientSession.FramesReceivedCount == 0 && ViewerEmptyState.Visibility == Visibility.Visible)
             {
@@ -590,6 +591,7 @@ public partial class MainWindow : Window
         _clientSession.ChatReceived += msg => Dispatcher.Invoke(() => AppendChatMessage(msg));
         _clientSession.Disconnected += reason => Dispatcher.Invoke(() =>
         {
+            if (_isFullscreen) ToggleFullscreen(false);
             _currentMonitors = [];
             ImgRemoteScreen.Source = null;
             TxtConnectStatus.Text = $"{LocalizationService.T("StatusDisconnected")}: {reason}";
@@ -751,6 +753,12 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
+        if (e.Key == Key.F11 && NavViewer.IsChecked == true)
+        {
+            ToggleFullscreen(!_isFullscreen);
+            e.Handled = true;
+            return;
+        }
         if (e.Key == Key.Escape)
         {
             if (ModalAbout.Visibility == Visibility.Visible) { ModalAbout.Visibility = Visibility.Collapsed; e.Handled = true; return; }
@@ -1122,11 +1130,39 @@ public partial class MainWindow : Window
     private void ToggleFullscreen(bool full)
     {
         _isFullscreen = full;
-        WindowState = full ? WindowState.Maximized : WindowState.Normal;
+        if (full)
+        {
+            TitleBarRow.Height = new GridLength(0);
+            TitleBarBorder.Visibility = Visibility.Collapsed;
+            TopHeaderBorder.Visibility = Visibility.Collapsed;
+            SidebarCol.Width = new GridLength(0);
+            SidebarBorder.Visibility = Visibility.Collapsed;
+            MainContentGrid.Margin = new Thickness(0);
+            ViewerToolbarBorder.Visibility = Visibility.Collapsed;
+            RemoteViewportHost.BorderThickness = new Thickness(0);
+            RemoteViewportHost.CornerRadius = new CornerRadius(0);
+            FullscreenOverlayBar.Visibility = Visibility.Visible;
+            WindowState = WindowState.Maximized;
+        }
+        else
+        {
+            TitleBarRow.Height = new GridLength(40);
+            TitleBarBorder.Visibility = Visibility.Visible;
+            TopHeaderBorder.Visibility = Visibility.Visible;
+            SidebarCol.Width = new GridLength(232);
+            SidebarBorder.Visibility = Visibility.Visible;
+            MainContentGrid.Margin = new Thickness(16);
+            ViewerToolbarBorder.Visibility = Visibility.Visible;
+            RemoteViewportHost.BorderThickness = new Thickness(1);
+            RemoteViewportHost.CornerRadius = new CornerRadius(10);
+            FullscreenOverlayBar.Visibility = Visibility.Collapsed;
+            WindowState = WindowState.Normal;
+        }
     }
 
     private async void BtnDisconnect_Click(object sender, RoutedEventArgs e)
     {
+        if (_isFullscreen) ToggleFullscreen(false);
         if (_clientSession is not null)
         {
             await _clientSession.DisposeAsync();
@@ -1152,7 +1188,7 @@ public partial class MainWindow : Window
     private void RemoteScreen_MouseMove(object sender, MouseEventArgs e)
     {
         if (_clientSession is null || !_clientSession.IsConnected) return;
-        if ((DateTime.UtcNow - _lastMouseMoveSent).TotalMilliseconds < 14) return;
+        if ((DateTime.UtcNow - _lastMouseMoveSent).TotalMilliseconds < 12) return;
         var c = GetNormalizedRemoteCoords(e);
         if (c is null) return;
         _lastMouseMoveSent = DateTime.UtcNow;

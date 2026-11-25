@@ -96,7 +96,7 @@ public sealed class TileDeltaEncoder
         var dirty = new bool[totalTiles];
         int dirtyCount = 0;
 
-        for (int ty = 0; ty < rows; ty++)
+        void ScanTileRow(int ty)
         {
             int py0 = ty * tile;
             int py1 = Math.Min(h, py0 + tile);
@@ -110,9 +110,19 @@ public sealed class TileDeltaEncoder
                 if (full || _prevHashes![idx] != hash)
                 {
                     dirty[idx] = true;
-                    dirtyCount++;
+                    Interlocked.Increment(ref dirtyCount);
                 }
             }
+        }
+
+        if (rows >= 10)
+        {
+            var popts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 4) };
+            Parallel.For(0, rows, popts, ScanTileRow);
+        }
+        else
+        {
+            for (int ty = 0; ty < rows; ty++) ScanTileRow(ty);
         }
 
         _prevHashes = newHashes;
@@ -128,7 +138,7 @@ public sealed class TileDeltaEncoder
 
         if (full || dirtyCount > totalTiles * 0.60)
         {
-            const int bandHeight = 96;
+            const int bandHeight = 64;
             var initialBands = new List<Rectangle>();
             for (int y = 0; y < h; y += bandHeight)
             {
@@ -258,28 +268,52 @@ public sealed class TileDeltaEncoder
             return;
         }
 
-        // Split horizontally into halves (or quadrants) so crisp edges stay sharp and every packet fits <= maxPacketBytes
-        int sliceCount = strip.Width >= 640 ? 4 : 2;
-        int q = Math.Max(34, baseQuality - 8);
-        int sliceW = Math.Max(32, strip.Width / sliceCount);
-        for (int s = 0; s < sliceCount; s++)
+        // Split dense strip into 2 halves first (only sub-split an overflowing half if needed)
+        int halfQ = Math.Max(38, baseQuality - 6);
+        int halfW = Math.Max(32, strip.Width / 2);
+        for (int s = 0; s < 2; s++)
         {
-            int sx = strip.X + s * sliceW;
-            int sw = (s == sliceCount - 1) ? (strip.X + strip.Width - sx) : sliceW;
+            int sx = strip.X + s * halfW;
+            int sw = (s == 1) ? (strip.X + strip.Width - sx) : halfW;
             if (sw <= 0) continue;
 
-            var jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, q);
-            if (jpg.Length > maxJpegBytes)
-                jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, 26);
-
-            results.Add(new EncodedVideoUpdate
+            var jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, halfQ);
+            if (jpg.Length <= maxJpegBytes || sw < 64)
             {
-                IsFullFrame = false,
-                FrameWidth = frameW,
-                FrameHeight = frameH,
-                Rects = [new VideoTileRect(sx, strip.Y, sw, strip.Height, jpg)],
-                TileSavingsPercent = 0
-            });
+                if (jpg.Length > maxJpegBytes)
+                    jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, 26);
+
+                results.Add(new EncodedVideoUpdate
+                {
+                    IsFullFrame = false,
+                    FrameWidth = frameW,
+                    FrameHeight = frameH,
+                    Rects = [new VideoTileRect(sx, strip.Y, sw, strip.Height, jpg)],
+                    TileSavingsPercent = 0
+                });
+                continue;
+            }
+
+            // Overflowing half -> split into 2 quarter slices
+            int qW = sw / 2;
+            int qSub = Math.Max(30, baseQuality - 12);
+            for (int sub = 0; sub < 2; sub++)
+            {
+                int qx = sx + sub * qW;
+                int rw = (sub == 1) ? (sx + sw - qx) : qW;
+                var subJpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, qx, strip.Y, rw, strip.Height, qSub);
+                if (subJpg.Length > maxJpegBytes)
+                    subJpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, qx, strip.Y, rw, strip.Height, 24);
+
+                results.Add(new EncodedVideoUpdate
+                {
+                    IsFullFrame = false,
+                    FrameWidth = frameW,
+                    FrameHeight = frameH,
+                    Rects = [new VideoTileRect(qx, strip.Y, rw, strip.Height, subJpg)],
+                    TileSavingsPercent = 0
+                });
+            }
         }
     }
 
@@ -459,18 +493,23 @@ public sealed class TileDeltaEncoder
         return hash;
     }
 
-    private static byte[] EncodeRegionJpeg(byte[] pixels, int fullW, int fullH, int stride, int rx, int ry, int rw, int rh, int quality)
+    private static unsafe byte[] EncodeRegionJpeg(byte[] pixels, int fullW, int fullH, int stride, int rx, int ry, int rw, int rh, int quality)
     {
-        using var regionBmp = new Bitmap(rw, rh, PixelFormat.Format24bppRgb);
-        var dstData = regionBmp.LockBits(new Rectangle(0, 0, rw, rh), ImageLockMode.WriteOnly, PixelFormat.Format24bppRgb);
+        using var regionBmp = new Bitmap(rw, rh, PixelFormat.Format32bppRgb);
+        var dstData = regionBmp.LockBits(new Rectangle(0, 0, rw, rh), ImageLockMode.WriteOnly, PixelFormat.Format32bppRgb);
         try
         {
-            for (int y = 0; y < rh; y++)
+            int copyBytes = rw * 4;
+            int dstStride = dstData.Stride;
+            fixed (byte* srcBase = pixels)
             {
-                int srcOff = (ry + y) * stride + rx * 4;
-                IntPtr dstRow = IntPtr.Add(dstData.Scan0, y * dstData.Stride);
-                // Convert 32bpp BGRA -> 24bpp BGR directly
-                CopyBgraToBgrRow(pixels, srcOff, dstRow, rw);
+                byte* dstBase = (byte*)dstData.Scan0;
+                for (int y = 0; y < rh; y++)
+                {
+                    byte* s = srcBase + (ry + y) * stride + rx * 4;
+                    byte* d = dstBase + y * dstStride;
+                    Buffer.MemoryCopy(s, d, copyBytes, copyBytes);
+                }
             }
         }
         finally
@@ -498,40 +537,10 @@ public sealed class TileDeltaEncoder
         int dstH = Math.Max(64, ((int)Math.Round(src.Height * ((double)dstW / src.Width))) & ~1);
         int dstStride = dstW * 4;
         var outPx = GC.AllocateUninitializedArray<byte>(dstStride * dstH);
-        bool boxFilter = src.Width >= dstW * 2 && src.Height >= dstH * 2;
 
         fixed (byte* srcBase = src.BgraPixels)
-        fixed (byte* dstBase = outPx)
         {
-            for (int y = 0; y < dstH; y++)
-            {
-                int sy0 = (int)((long)y * src.Height / dstH);
-                int sy1 = boxFilter && sy0 + 1 < src.Height ? sy0 + 1 : sy0;
-                byte* row0 = srcBase + sy0 * src.Stride;
-                byte* row1 = srcBase + sy1 * src.Stride;
-                uint* dstRow = (uint*)(dstBase + y * dstStride);
-
-                for (int x = 0; x < dstW; x++)
-                {
-                    int sx0 = (int)((long)x * src.Width / dstW);
-                    if (!boxFilter)
-                    {
-                        dstRow[x] = *(uint*)(row0 + sx0 * 4);
-                    }
-                    else
-                    {
-                        int sx1 = sx0 + 1 < src.Width ? sx0 + 1 : sx0;
-                        byte* p00 = row0 + sx0 * 4;
-                        byte* p01 = row0 + sx1 * 4;
-                        byte* p10 = row1 + sx0 * 4;
-                        byte* p11 = row1 + sx1 * 4;
-                        uint b = (uint)(p00[0] + p01[0] + p10[0] + p11[0]) >> 2;
-                        uint g = (uint)(p00[1] + p01[1] + p10[1] + p11[1]) >> 2;
-                        uint r = (uint)(p00[2] + p01[2] + p10[2] + p11[2]) >> 2;
-                        dstRow[x] = b | (g << 8) | (r << 16) | 0xFF000000u;
-                    }
-                }
-            }
+            DxgiScreenCapturer.DownscalePointerToBgra((IntPtr)srcBase, src.Stride, src.Width, src.Height, outPx, dstW, dstH);
         }
 
         return new CapturedFrame
@@ -544,22 +553,5 @@ public sealed class TileDeltaEncoder
             CursorY = (int)Math.Round(src.CursorY * ((double)dstH / src.Height)),
             CursorVisible = src.CursorVisible
         };
-    }
-
-    private static unsafe void CopyBgraToBgrRow(byte[] src, int srcOffset, IntPtr dstPtr, int pixelCount)
-    {
-        byte* dst = (byte*)dstPtr;
-        fixed (byte* sBase = src)
-        {
-            byte* s = sBase + srcOffset;
-            for (int i = 0; i < pixelCount; i++)
-            {
-                dst[0] = s[0];
-                dst[1] = s[1];
-                dst[2] = s[2];
-                dst += 3;
-                s += 4;
-            }
-        }
     }
 }

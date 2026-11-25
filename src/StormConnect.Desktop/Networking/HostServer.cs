@@ -6,6 +6,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Threading.Channels;
 using StormConnect.Desktop.Engine;
 using StormConnect.Protocol;
 
@@ -387,7 +388,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.4", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.5", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -569,6 +570,44 @@ public sealed class HostServer : IAsyncDisposable
 
         var activeUploads = new ConcurrentDictionary<string, (FileStream Stream, long TotalBytes, long Received, string Path, string ExpectedSha)>();
 
+        // Pipelined bounded queue so frame N+1 captures/encodes concurrently while frame N transmits asynchronously
+        var sendQueue = Channel.CreateBounded<(bool IsKey, List<(PacketType Type, byte[] Bytes)> Batch)>(new BoundedChannelOptions(2)
+        {
+            SingleReader = true,
+            SingleWriter = true,
+            FullMode = BoundedChannelFullMode.DropOldest
+        });
+
+        var sendTask = Task.Run(async () =>
+        {
+            try
+            {
+                await foreach (var item in sendQueue.Reader.ReadAllAsync(ct).ConfigureAwait(false))
+                {
+                    for (int i = 0; i < item.Batch.Count; i++)
+                    {
+                        if (ct.IsCancellationRequested || !channel.IsConnected) break;
+                        var (pktType, pktBytes) = item.Batch[i];
+                        await channel.SendPacketAsync(pktType, pktBytes, compress: false, ct).ConfigureAwait(false);
+                        if (channel.Mode == ConnectionMode.WssRelay && item.Batch.Count > 4 && i + 1 < item.Batch.Count)
+                        {
+                            await Task.Delay(4, ct).ConfigureAwait(false);
+                        }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+            catch (Exception ex)
+            {
+                if (!ct.IsCancellationRequested && channel.IsConnected)
+                {
+                    Services.SessionLogger.Log("HOST", $"Video send error: {ex.Message}");
+                    AuditLogEvent?.Invoke($"Video send error: {ex.Message}");
+                }
+            }
+        }, ct);
+
         // Dedicated OS thread so SetThreadDesktop stays pinned to WinSta0\Default / UAC / Lock desktop
         var videoDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var captureThread = new Thread(() =>
@@ -591,23 +630,23 @@ public sealed class HostServer : IAsyncDisposable
                         {
                             if (qSnapshot >= 85)
                             {
-                                maxWidth = mon == -1 ? 1920 : 1600;
+                                maxWidth = 1920;
                                 encodeQuality = 72;
                             }
                             else if (qSnapshot >= 65)
                             {
-                                maxWidth = mon == -1 ? 1600 : 1280;
-                                encodeQuality = 64;
+                                maxWidth = mon == -1 ? 1600 : 1440;
+                                encodeQuality = 68;
                             }
                             else if (qSnapshot >= 45)
                             {
                                 maxWidth = 1280;
-                                encodeQuality = 52;
+                                encodeQuality = 58;
                             }
                             else
                             {
                                 maxWidth = mon == -1 ? 1280 : 960;
-                                encodeQuality = 42;
+                                encodeQuality = 46;
                             }
                         }
 
@@ -617,23 +656,23 @@ public sealed class HostServer : IAsyncDisposable
                             if (channel.Mode == ConnectionMode.WssRelay)
                             {
                                 var atomicPackets = encoder.EncodeAtomicPackets(frame, encodeQuality, key, maxWidth, maxPacketBytes: 10_500);
-                                int totalBytes = 0;
-                                for (int i = 0; i < atomicPackets.Count; i++)
-                                {
-                                    if (ct.IsCancellationRequested || !channel.IsConnected) break;
-                                    var upd = atomicPackets[i];
-                                    var bytes = TileDeltaEncoder.SerializeVideoUpdate(upd);
-                                    totalBytes += bytes.Length;
-                                    channel.SendPacketAsync(PacketType.VideoFrameTiles, bytes, compress: false, ct).GetAwaiter().GetResult();
-
-                                    if (atomicPackets.Count > 3 && i + 1 < atomicPackets.Count)
-                                    {
-                                        if (ct.WaitHandle.WaitOne(12)) break;
-                                    }
-                                }
                                 if (atomicPackets.Count > 0)
                                 {
+                                    int totalBytes = 0;
+                                    var batch = new List<(PacketType Type, byte[] Bytes)>(atomicPackets.Count);
+                                    for (int i = 0; i < atomicPackets.Count; i++)
+                                    {
+                                        var bytes = TileDeltaEncoder.SerializeVideoUpdate(atomicPackets[i]);
+                                        totalBytes += bytes.Length;
+                                        batch.Add((PacketType.VideoFrameTiles, bytes));
+                                    }
                                     lastBytesSent = totalBytes;
+
+                                    if (key)
+                                        sendQueue.Writer.WriteAsync((true, batch), ct).AsTask().GetAwaiter().GetResult();
+                                    else
+                                        sendQueue.Writer.TryWrite((false, batch));
+
                                     framesSentCount++;
                                     if (framesSentCount <= 3 || key)
                                     {
@@ -648,11 +687,13 @@ public sealed class HostServer : IAsyncDisposable
                                 {
                                     var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
                                     lastBytesSent = bytes.Length;
-                                    channel.SendPacketAsync(
-                                        update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles,
-                                        bytes,
-                                        compress: false,
-                                        ct).GetAwaiter().GetResult();
+                                    var pktType = update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles;
+                                    var batch = new List<(PacketType Type, byte[] Bytes)>(1) { (pktType, bytes) };
+
+                                    if (key || update.IsFullFrame)
+                                        sendQueue.Writer.WriteAsync((true, batch), ct).AsTask().GetAwaiter().GetResult();
+                                    else
+                                        sendQueue.Writer.TryWrite((false, batch));
 
                                     framesSentCount++;
                                     if (framesSentCount <= 3)
@@ -678,8 +719,8 @@ public sealed class HostServer : IAsyncDisposable
 
                     int elapsed = (int)sw.ElapsedMilliseconds;
                     int targetInterval = channel.Mode == ConnectionMode.WssRelay
-                        ? Math.Clamp(lastBytesSent / 550, 35, 110)
-                        : 20;
+                        ? Math.Clamp(lastBytesSent / 700, 22, 80)
+                        : 16;
                     lastBytesSent = 0;
                     if (elapsed < targetInterval)
                     {
@@ -689,6 +730,7 @@ public sealed class HostServer : IAsyncDisposable
             }
             finally
             {
+                sendQueue.Writer.TryComplete();
                 videoDone.TrySetResult();
             }
         })
@@ -891,12 +933,14 @@ public sealed class HostServer : IAsyncDisposable
         {
             if (channel is EncryptedTransportChannel encCh)
                 encCh.InnerReconnected -= OnTransportReconnected;
+            sendQueue.Writer.TryComplete();
             sessionCts.Cancel();
             foreach (var up in activeUploads.Values)
             {
                 try { await up.Stream.DisposeAsync(); } catch { }
             }
             try { await videoTask; } catch { }
+            try { await sendTask; } catch { }
             try { await watchdogTask; } catch { }
         }
     }

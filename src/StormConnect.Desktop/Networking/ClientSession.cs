@@ -73,6 +73,8 @@ public sealed class ClientSession : IAsyncDisposable
     private int _coverageW;
     private int _coverageH;
     private volatile bool _baseFrameComplete;
+    private readonly ConcurrentQueue<(int FrameW, int FrameH, List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)> Slices)> _pendingUiBatches = new();
+    private int _uiFlushScheduled;
 
     public SessionTelemetry Telemetry { get; } = new();
     public SessionPermissions GrantedPermissions { get; private set; } = new();
@@ -873,43 +875,102 @@ public sealed class ClientSession : IAsyncDisposable
                 }));
             }
 
-            disp.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, () =>
+            _pendingUiBatches.Enqueue((frameW, frameH, decoded));
+            if (Interlocked.Exchange(ref _uiFlushScheduled, 1) == 0)
             {
-                try
-                {
-                    lock (_bmpLock)
-                    {
-                        if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
-                        {
-                            _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
-                        }
-
-                        foreach (var d in decoded)
-                        {
-                            int copyW = Math.Min(d.W, frameW - d.X);
-                            int copyH = Math.Min(d.H, frameH - d.Y);
-                            if (copyW <= 0 || copyH <= 0 || d.X < 0 || d.Y < 0) continue;
-                            _bitmap.WritePixels(new Int32Rect(0, 0, copyW, copyH), d.Bgra, d.Stride, d.X, d.Y);
-                        }
-                    }
-                    if (!_loggedFirstUiRender)
-                    {
-                        _loggedFirstUiRender = true;
-                        Services.SessionLogger.Log("CLIENT", $"UI rendered frame #1: {frameW}x{frameH}");
-                    }
-                    FrameUpdated?.Invoke(_bitmap);
-                }
-                catch (Exception ex)
-                {
-                    _lastVideoError = ex.Message;
-                    Services.SessionLogger.Log("CLIENT", $"UI WritePixels error: {ex.Message}");
-                }
-            });
+                disp.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, FlushPendingUiBatches);
+            }
         }
         catch (Exception ex)
         {
             _lastVideoError = ex.Message;
             Services.SessionLogger.Log("CLIENT", $"Video decode error: {ex.Message}");
+        }
+    }
+
+    private unsafe void FlushPendingUiBatches()
+    {
+        Interlocked.Exchange(ref _uiFlushScheduled, 0);
+        if (_pendingUiBatches.IsEmpty) return;
+
+        try
+        {
+            lock (_bmpLock)
+            {
+                while (_pendingUiBatches.TryDequeue(out var batch))
+                {
+                    int frameW = batch.FrameW;
+                    int frameH = batch.FrameH;
+                    if (frameW <= 0 || frameH <= 0 || batch.Slices.Count == 0) continue;
+
+                    if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
+                    {
+                        _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
+                    }
+
+                    int minX = frameW, minY = frameH, maxX = 0, maxY = 0;
+                    _bitmap.Lock();
+                    try
+                    {
+                        byte* backBuf = (byte*)_bitmap.BackBuffer;
+                        int backStride = _bitmap.BackBufferStride;
+
+                        foreach (var d in batch.Slices)
+                        {
+                            int copyW = Math.Min(d.W, frameW - d.X);
+                            int copyH = Math.Min(d.H, frameH - d.Y);
+                            if (copyW <= 0 || copyH <= 0 || d.X < 0 || d.Y < 0) continue;
+
+                            int rowBytes = Math.Min(copyW * 4, d.Stride);
+                            fixed (byte* srcBase = d.Bgra)
+                            {
+                                for (int row = 0; row < copyH; row++)
+                                {
+                                    if ((row + 1) * d.Stride > d.Bgra.Length) break;
+                                    byte* s = srcBase + row * d.Stride;
+                                    byte* dst = backBuf + (d.Y + row) * backStride + d.X * 4;
+                                    Buffer.MemoryCopy(s, dst, rowBytes, rowBytes);
+                                }
+                            }
+
+                            if (d.X < minX) minX = d.X;
+                            if (d.Y < minY) minY = d.Y;
+                            if (d.X + copyW > maxX) maxX = d.X + copyW;
+                            if (d.Y + copyH > maxY) maxY = d.Y + copyH;
+                        }
+
+                        if (maxX > minX && maxY > minY)
+                        {
+                            _bitmap.AddDirtyRect(new Int32Rect(minX, minY, maxX - minX, maxY - minY));
+                        }
+                    }
+                    finally
+                    {
+                        _bitmap.Unlock();
+                    }
+
+                    if (!_loggedFirstUiRender)
+                    {
+                        _loggedFirstUiRender = true;
+                        Services.SessionLogger.Log("CLIENT", $"UI rendered frame #1: {frameW}x{frameH}");
+                    }
+                }
+            }
+
+            if (_bitmap is not null)
+                FrameUpdated?.Invoke(_bitmap);
+        }
+        catch (Exception ex)
+        {
+            _lastVideoError = ex.Message;
+            Services.SessionLogger.Log("CLIENT", $"UI BackBuffer error: {ex.Message}");
+        }
+        finally
+        {
+            if (!_pendingUiBatches.IsEmpty && Interlocked.Exchange(ref _uiFlushScheduled, 1) == 0)
+            {
+                System.Windows.Application.Current?.Dispatcher?.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, FlushPendingUiBatches);
+            }
         }
     }
 
