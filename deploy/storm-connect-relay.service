@@ -1,0 +1,14 @@
+[Unit]
+Description=STORM CONNECT Zero-Knowledge Relay & UDP Signaling Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/storm-connect-relay
+ExecStart=/usr/bin/dotnet /opt/storm-connect-relay/StormConnect.Relay.dll --port 7443 --udp-port 7444
+Restart=always
+RestartSec=3
+Environment=ASPNETCORE_ENVIRONMENT=Production
+
+[Install]
+WantedBy=multi-user.target

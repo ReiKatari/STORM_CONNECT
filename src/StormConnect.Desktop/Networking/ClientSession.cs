@@ -1,0 +1,625 @@
+using System.Collections.Concurrent;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Net.Sockets;
+using System.Net.WebSockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Windows;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using StormConnect.Desktop.Engine;
+using StormConnect.Protocol;
+
+namespace StormConnect.Desktop.Networking;
+
+public sealed record FileTransferProgress(
+    string TransferId,
+    string FileName,
+    bool IsUpload,
+    long BytesDone,
+    long TotalBytes,
+    double SpeedMbps,
+    bool Completed,
+    string? Error
+);
+
+/// <summary>
+/// Remote viewer & controller session connecting via Direct TCP/LAN or WSS Relay,
+/// performing ECDH P-256 + AES-256-GCM handshake and rendering 60 FPS video directly into WPF WriteableBitmap.
+/// </summary>
+public sealed class ClientSession : IAsyncDisposable
+{
+    private readonly string _localStormId;
+    private readonly ClipboardWatcher _clipboard;
+    private ITransportChannel? _channel;
+    private CancellationTokenSource? _cts;
+    private WriteableBitmap? _bitmap;
+    private readonly object _bmpLock = new();
+    private readonly AudioStreamer _audio = new();
+    private readonly ConcurrentDictionary<string, (FileStream Stream, string LocalPath, string FileName, long Total, long Done, DateTime StartUtc)> _downloads = new();
+
+    private long _bytesRxWindow;
+    private int _framesWindow;
+    private DateTime _telemetryWindowStart = DateTime.UtcNow;
+    private double _lastFps;
+    private double _lastMbps;
+    private int _lastRttMs;
+    private double _lastTileSavings;
+    private int _activeMonitorIndex;
+    private bool _audioEnabled = true;
+
+    public SessionTelemetry Telemetry { get; } = new();
+    public SessionPermissions GrantedPermissions { get; private set; } = new();
+    public string RemoteHostName { get; private set; } = string.Empty;
+    public string RemoteStormId { get; private set; } = string.Empty;
+    public IReadOnlyList<MonitorInfo> Monitors { get; private set; } = [];
+    public WriteableBitmap? FrameBitmap => _bitmap;
+    public bool IsConnected => _channel?.IsConnected == true;
+
+    public event Action<WriteableBitmap>? FrameUpdated;
+    public event Action<IReadOnlyList<MonitorInfo>>? MonitorsUpdated;
+    public event Action<SessionTelemetry>? TelemetryUpdated;
+    public event Action<FileListResponsePayload>? FileListReceived;
+    public event Action<FileTransferProgress>? FileTransferProgressed;
+    public event Action<FileOperationResponsePayload>? FileOperationCompleted;
+    public event Action<ChatMessagePayload>? ChatReceived;
+    public event Action<string>? StatusChanged;
+    public event Action<string>? Disconnected;
+
+    public ClientSession(string localStormId, ClipboardWatcher clipboard)
+    {
+        _localStormId = DeviceIdentity.NormalizeId(localStormId);
+        _clipboard = clipboard;
+        _clipboard.LocalClipboardChanged += OnLocalClipboardChanged;
+    }
+
+    public async Task ConnectAsync(
+        string targetInput,
+        string relayUrl,
+        IReadOnlyList<DiscoveredDevice> lanDevices,
+        Func<string, bool, Task<string?>> promptPasswordOrPin,
+        CancellationToken ct = default)
+    {
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var token = _cts.Token;
+
+        ITransportChannel? rawChannel = null;
+        string trimmed = targetInput.Trim();
+        string normDigits = DeviceIdentity.NormalizeId(trimmed);
+
+        // 1. Check if target is an IP:Port or hostname
+        if (normDigits.Length != 9 || trimmed.Contains('.') || trimmed.Contains(':'))
+        {
+            StatusChanged?.Invoke("Connecting via Direct IP...");
+            rawChannel = await ConnectDirectTcpAsync(trimmed, ProtocolConstants.DefaultDirectPort, ConnectionMode.DirectIp, token).ConfigureAwait(false);
+        }
+        else
+        {
+            // 2. Check if target is discovered on LAN for 0-hop gigabit speed
+            var lanPeer = lanDevices.FirstOrDefault(d => d.StormId == normDigits);
+            if (lanPeer is not null)
+            {
+                try
+                {
+                    StatusChanged?.Invoke($"Connecting via LAN Direct ({lanPeer.LocalIp})...");
+                    rawChannel = await ConnectDirectTcpAsync(lanPeer.LocalIp, lanPeer.DirectPort, ConnectionMode.LanDirect, token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    rawChannel = null;
+                }
+            }
+
+            // 3. Fallback to zero-knowledge WSS Relay
+            if (rawChannel is null)
+            {
+                StatusChanged?.Invoke("Connecting via STORM CONNECT Relay...");
+                rawChannel = await ConnectViaRelayAsync(normDigits, relayUrl, token).ConfigureAwait(false);
+            }
+        }
+
+        if (rawChannel is null)
+            throw new IOException("Unable to establish connection to target peer.");
+
+        // 4. ECDH P-256 + AES-256-GCM Handshake (Client is Initiator)
+        using var crypto = new CryptoSession();
+        var hostKeyPkt = await rawChannel.ReceivePacketAsync(token).ConfigureAwait(false);
+        if (hostKeyPkt is null || hostKeyPkt.Type != PacketType.KeyExchange)
+            throw new IOException("Host closed during key exchange.");
+
+        await rawChannel.SendPacketAsync(PacketType.KeyExchange, crypto.LocalPublicKeyUncompressed, ct: token).ConfigureAwait(false);
+        crypto.DeriveKeys(hostKeyPkt.Payload, isInitiator: true);
+
+        _channel = new EncryptedTransportChannel(rawChannel, crypto);
+        Telemetry.Mode = _channel.Mode;
+
+        // 5. Read Hello + AuthChallenge
+        var helloPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
+        if (helloPkt?.Type == PacketType.Hello)
+        {
+            var hello = FrameCodec.DeserializeJson<HelloPayload>(helloPkt.Payload);
+            if (hello is not null)
+            {
+                RemoteHostName = hello.HostName;
+                RemoteStormId = hello.StormId;
+            }
+        }
+
+        var chalPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
+        if (chalPkt is null || chalPkt.Type != PacketType.AuthRequest)
+            throw new IOException("Missing authentication challenge.");
+
+        var chal = FrameCodec.DeserializeJson<AuthChallengePayload>(chalPkt.Payload)
+            ?? throw new IOException("Invalid authentication challenge.");
+
+        string? secret = await promptPasswordOrPin(RemoteHostName, chal.AllowUnattended).ConfigureAwait(false);
+        AuthMode mode = AuthMode.PinOrConsent;
+        string? proof = null;
+
+        if (!string.IsNullOrWhiteSpace(secret))
+        {
+            mode = chal.AllowUnattended && secret.Length > 6 ? AuthMode.UnattendedPassword : AuthMode.PinOrConsent;
+            proof = CryptoSession.ComputeChallengeProof(secret, chal.Salt, chal.NonceChallenge);
+        }
+
+        var authReq = new AuthRequestPayload(_localStormId, Environment.MachineName, mode, proof, null);
+        await _channel.SendPacketAsync(PacketType.AuthRequest, FrameCodec.SerializeJson(authReq), ct: token).ConfigureAwait(false);
+
+        while (true)
+        {
+            var respPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
+            if (respPkt is null) throw new IOException("Connection closed before authorization.");
+            if (respPkt.Type != PacketType.AuthResponse) continue;
+
+            var resp = FrameCodec.DeserializeJson<AuthResponsePayload>(respPkt.Payload);
+            if (resp is null) throw new IOException("Invalid auth response.");
+            if (resp.PendingConsent)
+            {
+                StatusChanged?.Invoke("Waiting for remote user approval...");
+                continue;
+            }
+            if (!resp.Accepted)
+                throw new UnauthorizedAccessException(resp.Reason);
+
+            GrantedPermissions = resp.Permissions;
+            break;
+        }
+
+        if (GrantedPermissions.AllowAudio && _audioEnabled)
+            _audio.StartPlayback();
+
+        StatusChanged?.Invoke($"Connected to {RemoteHostName}");
+        _ = Task.Run(() => ReceiveLoopAsync(token), token);
+        _ = Task.Run(() => PingLoopAsync(token), token);
+    }
+
+    private static async Task<ITransportChannel> ConnectDirectTcpAsync(string hostSpec, int defaultPort, ConnectionMode mode, CancellationToken ct)
+    {
+        string host = hostSpec;
+        int port = defaultPort;
+        int colon = hostSpec.LastIndexOf(':');
+        if (colon > 0 && int.TryParse(hostSpec[(colon + 1)..], out int parsedPort))
+        {
+            host = hostSpec[..colon];
+            port = parsedPort;
+        }
+
+        var tcp = new TcpClient();
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+        await tcp.ConnectAsync(host, port, timeoutCts.Token).ConfigureAwait(false);
+        return new TcpTransportChannel(tcp, mode);
+    }
+
+    private async Task<ITransportChannel> ConnectViaRelayAsync(string targetId, string relayUrl, CancellationToken ct)
+    {
+        var ctrlWs = new ClientWebSocket();
+        await ctrlWs.ConnectAsync(new Uri(relayUrl), ct).ConfigureAwait(false);
+        await using var ctrlCh = new WebSocketTransportChannel(ctrlWs, ConnectionMode.WssRelay);
+
+        var reg = new RelayRegisterPayload(_localStormId, Environment.MachineName, "Windows", 1, ProtocolConstants.DefaultDirectPort, null);
+        await ctrlCh.SendPacketAsync(PacketType.RelayRegister, FrameCodec.SerializeJson(reg), ct: ct).ConfigureAwait(false);
+
+        var conn = new RelayConnectPayload(_localStormId, targetId);
+        await ctrlCh.SendPacketAsync(PacketType.RelayConnect, FrameCodec.SerializeJson(conn), ct: ct).ConfigureAwait(false);
+
+        RelayPairedPayload? paired = null;
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(15));
+
+        while (!timeoutCts.IsCancellationRequested)
+        {
+            var pkt = await ctrlCh.ReceivePacketAsync(timeoutCts.Token).ConfigureAwait(false);
+            if (pkt is null) break;
+            if (pkt.Type == PacketType.RelayError)
+                throw new IOException(Encoding.UTF8.GetString(pkt.Payload));
+            if (pkt.Type == PacketType.RelayPaired)
+            {
+                paired = FrameCodec.DeserializeJson<RelayPairedPayload>(pkt.Payload);
+                break;
+            }
+        }
+
+        if (paired is null)
+            throw new TimeoutException("Relay pairing timed out.");
+
+        var baseUri = new Uri(relayUrl);
+        var builder = new UriBuilder(baseUri)
+        {
+            Path = $"/session/{paired.SessionToken}",
+            Query = "role=initiator"
+        };
+        var pipeWs = new ClientWebSocket();
+        pipeWs.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+        await pipeWs.ConnectAsync(builder.Uri, ct).ConfigureAwait(false);
+        return new WebSocketTransportChannel(pipeWs, ConnectionMode.WssRelay);
+    }
+
+    private async Task ReceiveLoopAsync(CancellationToken ct)
+    {
+        string disconnectReason = "Session closed";
+        try
+        {
+            while (_channel is not null && _channel.IsConnected && !ct.IsCancellationRequested)
+            {
+                var pkt = await _channel.ReceivePacketAsync(ct).ConfigureAwait(false);
+                if (pkt is null || pkt.Type == PacketType.Disconnect)
+                {
+                    if (pkt?.Payload.Length > 0)
+                        disconnectReason = Encoding.UTF8.GetString(pkt.Payload);
+                    break;
+                }
+
+                Interlocked.Add(ref _bytesRxWindow, pkt.Payload.Length);
+                Telemetry.TotalBytesReceived += pkt.Payload.Length;
+
+                switch (pkt.Type)
+                {
+                    case PacketType.MonitorList:
+                        var list = FrameCodec.DeserializeJson<List<MonitorInfo>>(pkt.Payload);
+                        if (list is not null)
+                        {
+                            Monitors = list;
+                            MonitorsUpdated?.Invoke(list);
+                        }
+                        break;
+
+                    case PacketType.VideoFrameFull:
+                    case PacketType.VideoFrameTiles:
+                        var (w, h, rects) = TileDeltaEncoder.DeserializeVideoUpdate(pkt.Payload);
+                        ApplyVideoUpdate(w, h, rects);
+                        Interlocked.Increment(ref _framesWindow);
+                        if (pkt.Type == PacketType.VideoFrameFull) _lastTileSavings = 0;
+                        else
+                        {
+                            double changedArea = rects.Sum(r => (double)r.Width * r.Height);
+                            _lastTileSavings = Math.Round(Math.Clamp(1.0 - changedArea / Math.Max(1.0, (double)w * h), 0, 1) * 100.0, 1);
+                        }
+                        Telemetry.FrameWidth = w;
+                        Telemetry.FrameHeight = h;
+                        break;
+
+                    case PacketType.AudioFrame:
+                        if (_audioEnabled && GrantedPermissions.AllowAudio)
+                            _audio.EnqueuePlaybackFrame(pkt.Payload);
+                        break;
+
+                    case PacketType.ClipboardData:
+                        if (GrantedPermissions.AllowClipboard)
+                        {
+                            var cb = FrameCodec.DeserializeJson<ClipboardPayload>(pkt.Payload);
+                            if (cb is not null) _clipboard.ApplyRemoteClipboard(cb);
+                        }
+                        break;
+
+                    case PacketType.FileListResp:
+                        var fl = FrameCodec.DeserializeJson<FileListResponsePayload>(pkt.Payload);
+                        if (fl is not null) FileListReceived?.Invoke(fl);
+                        break;
+
+                    case PacketType.FileOperationResp:
+                        var op = FrameCodec.DeserializeJson<FileOperationResponsePayload>(pkt.Payload);
+                        if (op is not null) FileOperationCompleted?.Invoke(op);
+                        break;
+
+                    case PacketType.FileTransferInit:
+                        var init = FrameCodec.DeserializeJson<FileTransferInitPayload>(pkt.Payload);
+                        if (init is not null && !init.IsUploadToRemote)
+                        {
+                            var localSavePath = Path.Combine(
+                                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                                "Downloads",
+                                "STORM CONNECT",
+                                init.FileName);
+                            Directory.CreateDirectory(Path.GetDirectoryName(localSavePath)!);
+                            var fs = new FileStream(localSavePath, FileMode.Create, FileAccess.Write, FileShare.None);
+                            _downloads[init.TransferId] = (fs, localSavePath, init.FileName, init.TotalBytes, 0, DateTime.UtcNow);
+                            if (init.TotalBytes == 0)
+                            {
+                                await fs.DisposeAsync().ConfigureAwait(false);
+                                _downloads.TryRemove(init.TransferId, out _);
+                                FileTransferProgressed?.Invoke(new FileTransferProgress(init.TransferId, init.FileName, false, 0, 0, 0, true, null));
+                            }
+                        }
+                        break;
+
+                    case PacketType.FileTransferChunk:
+                        if (pkt.Payload.Length >= 36)
+                        {
+                            var tid = Encoding.ASCII.GetString(pkt.Payload, 0, 32).Trim();
+                            int dataLen = BitConverter.ToInt32(pkt.Payload, 32);
+                            if (_downloads.TryGetValue(tid, out var d))
+                            {
+                                await d.Stream.WriteAsync(pkt.Payload.AsMemory(36, dataLen), ct).ConfigureAwait(false);
+                                long done = d.Done + dataLen;
+                                _downloads[tid] = (d.Stream, d.LocalPath, d.FileName, d.Total, done, d.StartUtc);
+                                double sec = Math.Max(0.05, (DateTime.UtcNow - d.StartUtc).TotalSeconds);
+                                double mbps = (done * 8.0 / 1_000_000.0) / sec;
+                                bool completed = done >= d.Total;
+                                if (completed)
+                                {
+                                    await d.Stream.DisposeAsync().ConfigureAwait(false);
+                                    _downloads.TryRemove(tid, out _);
+                                }
+                                FileTransferProgressed?.Invoke(new FileTransferProgress(tid, d.FileName, false, done, d.Total, Math.Round(mbps, 2), completed, null));
+                            }
+                        }
+                        break;
+
+                    case PacketType.FileTransferAck:
+                        var ack = FrameCodec.DeserializeJson<FileTransferAckPayload>(pkt.Payload);
+                        if (ack is not null)
+                        {
+                            FileTransferProgressed?.Invoke(new FileTransferProgress(
+                                ack.TransferId, "", true, ack.BytesReceived, ack.BytesReceived, 0, ack.Success, ack.Success ? null : ack.Message));
+                        }
+                        break;
+
+                    case PacketType.ChatMessage:
+                        var chat = FrameCodec.DeserializeJson<ChatMessagePayload>(pkt.Payload);
+                        if (chat is not null) ChatReceived?.Invoke(chat);
+                        break;
+
+                    case PacketType.Pong:
+                        if (pkt.Payload.Length >= 8)
+                        {
+                            long sentTicks = BitConverter.ToInt64(pkt.Payload, 0);
+                            _lastRttMs = (int)Math.Max(1, (DateTime.UtcNow.Ticks - sentTicks) / TimeSpan.TicksPerMillisecond);
+                        }
+                        break;
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            disconnectReason = ex.Message;
+        }
+        finally
+        {
+            foreach (var d in _downloads.Values)
+            {
+                try { await d.Stream.DisposeAsync(); } catch { }
+            }
+            _downloads.Clear();
+            Disconnected?.Invoke(disconnectReason);
+        }
+    }
+
+    private void ApplyVideoUpdate(int frameW, int frameH, List<VideoTileRect> rects)
+    {
+        var disp = System.Windows.Application.Current?.Dispatcher;
+        if (disp is null) return;
+
+        // Decode JPEG slices into raw BGRA arrays off the UI thread for buttery smooth rendering
+        var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
+        foreach (var r in rects)
+        {
+            using var ms = new MemoryStream(r.JpegBytes);
+            using var bmp = new Bitmap(ms);
+            var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+            try
+            {
+                var px = new byte[bd.Stride * bmp.Height];
+                System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, px, 0, px.Length);
+                decoded.Add((r.X, r.Y, bmp.Width, bmp.Height, bd.Stride, px));
+            }
+            finally
+            {
+                bmp.UnlockBits(bd);
+            }
+        }
+
+        disp.BeginInvoke(() =>
+        {
+            lock (_bmpLock)
+            {
+                if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
+                {
+                    _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
+                }
+
+                _bitmap.Lock();
+                try
+                {
+                    foreach (var d in decoded)
+                    {
+                        int copyW = Math.Min(d.W, frameW - d.X);
+                        int copyH = Math.Min(d.H, frameH - d.Y);
+                        if (copyW <= 0 || copyH <= 0) continue;
+                        _bitmap.WritePixels(new Int32Rect(d.X, d.Y, copyW, copyH), d.Bgra, d.Stride, 0);
+                    }
+                }
+                finally
+                {
+                    _bitmap.Unlock();
+                }
+            }
+            FrameUpdated?.Invoke(_bitmap);
+        });
+    }
+
+    private async Task PingLoopAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested && IsConnected)
+        {
+            try
+            {
+                await _channel!.SendPacketAsync(PacketType.Ping, BitConverter.GetBytes(DateTime.UtcNow.Ticks), ct: ct).ConfigureAwait(false);
+                var now = DateTime.UtcNow;
+                double sec = Math.Max(0.25, (now - _telemetryWindowStart).TotalSeconds);
+                long rx = Interlocked.Exchange(ref _bytesRxWindow, 0);
+                int frames = Interlocked.Exchange(ref _framesWindow, 0);
+                _telemetryWindowStart = now;
+
+                _lastFps = Math.Round(frames / sec, 1);
+                _lastMbps = Math.Round((rx * 8.0 / 1_000_000.0) / sec, 2);
+
+                Telemetry.Fps = _lastFps;
+                Telemetry.BandwidthMbps = _lastMbps;
+                Telemetry.RttMs = _lastRttMs;
+                Telemetry.TileSavingsPercent = _lastTileSavings;
+                Telemetry.ActiveMonitorIndex = _activeMonitorIndex;
+                TelemetryUpdated?.Invoke(Telemetry);
+            }
+            catch { }
+
+            try { await Task.Delay(1000, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    public async Task SelectMonitorAsync(int monitorIndex, int jpegQuality = 72)
+    {
+        _activeMonitorIndex = monitorIndex;
+        if (_channel is null) return;
+        var buf = new byte[8];
+        BitConverter.TryWriteBytes(buf.AsSpan(0, 4), monitorIndex);
+        BitConverter.TryWriteBytes(buf.AsSpan(4, 4), jpegQuality);
+        await _channel.SendPacketAsync(PacketType.MonitorSelect, buf).ConfigureAwait(false);
+    }
+
+    public Task SendMouseAsync(MouseEventData ev)
+    {
+        if (_channel is null || !GrantedPermissions.AllowControl) return Task.CompletedTask;
+        var buf = new byte[20];
+        BitConverter.TryWriteBytes(buf.AsSpan(0, 8), ev.NormX);
+        BitConverter.TryWriteBytes(buf.AsSpan(8, 8), ev.NormY);
+        buf[16] = ev.Button;
+        buf[17] = ev.Action;
+        BitConverter.TryWriteBytes(buf.AsSpan(18, 2), ev.WheelDelta);
+        return _channel.SendPacketAsync(PacketType.InputMouse, buf);
+    }
+
+    public Task SendKeyAsync(KeyEventData ev)
+    {
+        if (_channel is null || !GrantedPermissions.AllowControl) return Task.CompletedTask;
+        var buf = new byte[8];
+        BitConverter.TryWriteBytes(buf.AsSpan(0, 2), ev.VirtualKey);
+        BitConverter.TryWriteBytes(buf.AsSpan(2, 2), ev.ScanCode);
+        buf[4] = ev.IsKeyUp ? (byte)1 : (byte)0;
+        buf[5] = ev.IsExtended ? (byte)1 : (byte)0;
+        BitConverter.TryWriteBytes(buf.AsSpan(6, 2), (ushort)(ev.UnicodeChar ?? '\0'));
+        return _channel.SendPacketAsync(PacketType.InputKeyboard, buf);
+    }
+
+    public Task SendSystemActionAsync(SystemActionKind kind)
+    {
+        if (_channel is null) return Task.CompletedTask;
+        return _channel.SendPacketAsync(PacketType.SessionAction, new byte[] { (byte)kind });
+    }
+
+    public Task RequestFileListAsync(string path)
+    {
+        if (_channel is null) return Task.CompletedTask;
+        return _channel.SendPacketAsync(PacketType.FileListReq, Encoding.UTF8.GetBytes(path));
+    }
+
+    public Task RequestFileOperationAsync(FileOperationRequestPayload op)
+    {
+        if (_channel is null) return Task.CompletedTask;
+        return _channel.SendPacketAsync(PacketType.FileOperationReq, FrameCodec.SerializeJson(op));
+    }
+
+    public Task RequestFileDownloadAsync(string remotePath, string fileName)
+    {
+        if (_channel is null) return Task.CompletedTask;
+        var tid = Guid.NewGuid().ToString("N");
+        var init = new FileTransferInitPayload(tid, IsUploadToRemote: false, remotePath, fileName, 0, "");
+        return _channel.SendPacketAsync(PacketType.FileTransferInit, FrameCodec.SerializeJson(init));
+    }
+
+    public async Task UploadFileAsync(string localFilePath, string remoteDestinationDir, CancellationToken ct = default)
+    {
+        if (_channel is null || !File.Exists(localFilePath)) return;
+        var fi = new FileInfo(localFilePath);
+        var tid = Guid.NewGuid().ToString("N");
+        string remotePath = string.IsNullOrWhiteSpace(remoteDestinationDir)
+            ? fi.Name
+            : Path.Combine(remoteDestinationDir, fi.Name);
+
+        string sha;
+        await using (var hfs = File.OpenRead(localFilePath))
+            sha = Convert.ToHexString(await SHA256.HashDataAsync(hfs, ct).ConfigureAwait(false));
+
+        var init = new FileTransferInitPayload(tid, IsUploadToRemote: true, remotePath, fi.Name, fi.Length, sha);
+        await _channel.SendPacketAsync(PacketType.FileTransferInit, FrameCodec.SerializeJson(init), ct: ct).ConfigureAwait(false);
+
+        var tidBytes = Encoding.ASCII.GetBytes(tid);
+        var buf = new byte[ProtocolConstants.FileChunkBytes + 36];
+        Buffer.BlockCopy(tidBytes, 0, buf, 0, 32);
+
+        long sent = 0;
+        var start = DateTime.UtcNow;
+        await using var fs = new FileStream(localFilePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+        int read;
+        while ((read = await fs.ReadAsync(buf.AsMemory(36, ProtocolConstants.FileChunkBytes), ct).ConfigureAwait(false)) > 0)
+        {
+            BitConverter.TryWriteBytes(buf.AsSpan(32, 4), read);
+            await _channel.SendPacketAsync(PacketType.FileTransferChunk, buf.AsMemory(0, 36 + read), ct: ct).ConfigureAwait(false);
+            sent += read;
+            double sec = Math.Max(0.05, (DateTime.UtcNow - start).TotalSeconds);
+            double mbps = (sent * 8.0 / 1_000_000.0) / sec;
+            FileTransferProgressed?.Invoke(new FileTransferProgress(tid, fi.Name, true, sent, fi.Length, Math.Round(mbps, 2), sent >= fi.Length, null));
+        }
+    }
+
+    public Task SendChatAsync(string text)
+    {
+        if (_channel is null) return Task.CompletedTask;
+        var msg = new ChatMessagePayload(Environment.MachineName, text, DateTime.UtcNow);
+        return _channel.SendPacketAsync(PacketType.ChatMessage, FrameCodec.SerializeJson(msg));
+    }
+
+    public void SetAudioEnabled(bool enabled)
+    {
+        _audioEnabled = enabled;
+        if (enabled && IsConnected && GrantedPermissions.AllowAudio) _audio.StartPlayback();
+        else _audio.StopPlayback();
+    }
+
+    private void OnLocalClipboardChanged(ClipboardPayload payload)
+    {
+        if (_channel is null || !IsConnected || !GrantedPermissions.AllowClipboard) return;
+        _ = Task.Run(async () =>
+        {
+            try { await _channel.SendPacketAsync(PacketType.ClipboardData, FrameCodec.SerializeJson(payload), compress: true).ConfigureAwait(false); } catch { }
+        });
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        _clipboard.LocalClipboardChanged -= OnLocalClipboardChanged;
+        _cts?.Cancel();
+        _audio.Dispose();
+        if (_channel is not null)
+        {
+            try { await _channel.SendPacketAsync(PacketType.Disconnect, Array.Empty<byte>()).ConfigureAwait(false); } catch { }
+            await _channel.DisposeAsync().ConfigureAwait(false);
+            _channel = null;
+        }
+        _cts?.Dispose();
+    }
+}

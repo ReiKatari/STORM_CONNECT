@@ -1,0 +1,12 @@
+services:
+  storm-connect-relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: storm-connect-relay
+    restart: unless-stopped
+    ports:
+      - "7443:7443"
+      - "7444:7444/udp"
+    environment:
+      - STORM_RELAY_PORT=7443

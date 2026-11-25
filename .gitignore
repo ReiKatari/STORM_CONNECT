@@ -1,0 +1,59 @@
+# Compiled & Build Artifacts
+bin/
+obj/
+out/
+publish/
+build/
+dist/
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.cache
+*.pdb
+*.exe
+*.dll
+*.so
+*.dylib
+*.zip
+*.7z
+*.tar.gz
+*.apk
+*.aab
+
+# STORM Release Output Directory
+Files/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+*.iml
+captures/
+
+# Secrets, Certificates & Keys (NEVER commit)
+.storm-secrets/
+*storm_git_token*
+*.jks
+*.keystore
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+*.pub
+*.mobileprovision
+
+# Temporary & Logs
+*.log
+*.tmp
+*.bak
+test_*
+temp_*
+*logcat*
+WORK/
+Payload/
+installer/StormInstaller/Payload/
