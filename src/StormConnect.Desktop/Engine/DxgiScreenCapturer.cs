@@ -143,6 +143,16 @@ public sealed class DxgiScreenCapturer : IDisposable
 
                 try
                 {
+                    // Validate desktopTex format (B8G8R8A8=87) & dimensions before CopyResource so HDR/scaled outputs fall back cleanly to GDI BitBlt
+                    var getDesc = Marshal.GetDelegateForFunctionPointer<GetTextureDescDelegate>(GetVtableSlot(desktopTex, 10));
+                    getDesc(desktopTex, out var texDesc);
+                    if (texDesc.Width != _dupWidth || texDesc.Height != _dupHeight || texDesc.Format != 87)
+                    {
+                        ReleaseDxgi();
+                        _dxgiDisabled = true;
+                        return null;
+                    }
+
                     // ID3D11DeviceContext::CopyResource (vtable slot 47)
                     var copyRes = Marshal.GetDelegateForFunctionPointer<CopyResourceDelegate>(GetVtableSlot(_d3dContext, 47));
                     copyRes(_d3dContext, _stagingTex, desktopTex);
@@ -334,6 +344,7 @@ public sealed class DxgiScreenCapturer : IDisposable
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int EnumOutputsDelegate(IntPtr self, uint idx, out IntPtr output);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int DuplicateOutputDelegate(IntPtr self, IntPtr device, out IntPtr dup);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int CreateTexture2DDelegate(IntPtr self, ref D3D11_TEXTURE2D_DESC desc, IntPtr initData, out IntPtr tex);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void GetTextureDescDelegate(IntPtr self, out D3D11_TEXTURE2D_DESC desc);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int AcquireNextFrameDelegate(IntPtr self, uint timeoutMs, out DXGI_OUTDUPL_FRAME_INFO info, out IntPtr res);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int ReleaseFrameDelegate(IntPtr self);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate void CopyResourceDelegate(IntPtr self, IntPtr dst, IntPtr src);

@@ -131,7 +131,7 @@ class MqttWssClient {
         val out = ByteArrayOutputStream(remLen + 5)
         out.write(0x10)
         writeRemLen(out, remLen)
-        out.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 0x1E))
+        out.write(byteArrayOf(0x00, 0x04, 'M'.code.toByte(), 'Q'.code.toByte(), 'T'.code.toByte(), 'T'.code.toByte(), 0x04, 0x02, 0x00, 0x3C))
         out.write((cid.size ushr 8) and 0xFF)
         out.write(cid.size and 0xFF)
         out.write(cid)
@@ -194,7 +194,6 @@ class MqttWssClient {
 
     companion object {
         val PUBLIC_BROKERS = listOf(
-            "wss://broker.emqx.io:8084/mqtt",
             "wss://broker.hivemq.com:8884/mqtt",
             "wss://test.mosquitto.org:8081/mqtt"
         )
@@ -224,7 +223,7 @@ class MqttPipeTransportChannel(
         } else payload
         val rawFrame = FrameCodec.encodePlain(type, data, flags)
         val msgId = nextMsgId++
-        val maxBody = 16 * 1024
+        val maxBody = 60 * 1024
         val partCount = maxOf(1, (rawFrame.size + maxBody - 1) / maxBody)
 
         for (p in 0 until partCount) {

@@ -31,7 +31,7 @@ public sealed class MqttWssClient : IAsyncDisposable
     {
         BrokerUrl = brokerUrl;
         _ws.Options.AddSubProtocol("mqtt");
-        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(20);
+        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
         await _ws.ConnectAsync(new Uri(brokerUrl), ct).ConfigureAwait(false);
 
         _rxTask = Task.Run(() => ReceiveLoopAsync(_cts.Token));
@@ -248,7 +248,7 @@ public sealed class MqttWssClient : IAsyncDisposable
         using var ms = new MemoryStream(remLen + 5);
         ms.WriteByte(0x10);
         WriteRemainingLength(ms, remLen);
-        ms.Write(new byte[] { 0x00, 0x04, (byte)'M', (byte)'Q', (byte)'T', (byte)'T', 0x04, 0x02, 0x00, 0x1E });
+        ms.Write(new byte[] { 0x00, 0x04, (byte)'M', (byte)'Q', (byte)'T', (byte)'T', 0x04, 0x02, 0x00, 0x3C });
         WriteUtf8String(ms, cidBytes);
         return ms.ToArray();
     }
@@ -313,11 +313,11 @@ public sealed class MqttWssClient : IAsyncDisposable
 }
 
 /// <summary>
-/// Full ITransportChannel over MQTT-over-WSS with automatic 16 KB packet chunking &amp; reassembly.
+/// Full ITransportChannel over MQTT-over-WSS with automatic 60 KB atomic packet chunking &amp; reassembly.
 /// </summary>
 public sealed class MqttPipeTransportChannel : ITransportChannel
 {
-    private const int MaxChunkBody = 12 * 1024;
+    private const int MaxChunkBody = 60 * 1024;
     private readonly MqttWssClient _mqtt;
     private readonly string _txTopic;
     private readonly string _rxTopic;

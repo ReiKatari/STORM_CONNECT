@@ -39,6 +39,8 @@ public partial class MainWindow : Window
     private bool _audioEnabled = true;
     private bool _isFullscreen;
     private bool _initializingUi = true;
+    private bool _formattingStormId;
+    private bool _suppressMonitorSelect;
     private DateTime _lastMouseMoveSent = DateTime.MinValue;
     private UpdateCheckResult? _pendingUpdate;
     private CancellationTokenSource? _updateDlCts;
@@ -539,8 +541,16 @@ public partial class MainWindow : Window
         _clientSession.MonitorsUpdated += mons => Dispatcher.Invoke(() =>
         {
             _currentMonitors = mons;
-            CmbMonitorSelect.ItemsSource = mons;
-            if (mons.Count > 0) CmbMonitorSelect.SelectedIndex = 0;
+            _suppressMonitorSelect = true;
+            try
+            {
+                CmbMonitorSelect.ItemsSource = mons;
+                if (mons.Count > 0) CmbMonitorSelect.SelectedIndex = 0;
+            }
+            finally
+            {
+                _suppressMonitorSelect = false;
+            }
             RebuildMonitorPills();
         });
         _clientSession.TelemetryUpdated += tel => Dispatcher.Invoke(() =>
@@ -846,6 +856,39 @@ public partial class MainWindow : Window
         if (e.Key == Key.Enter) _ = ConnectToTargetAsync(TxtTargetInput.Text);
     }
 
+    private void TxtStormId_AutoFormat(object sender, TextChangedEventArgs e)
+    {
+        if (_formattingStormId || sender is not System.Windows.Controls.TextBox tb) return;
+        string current = tb.Text;
+        string formatted = DeviceIdentity.FormatInputLive(current);
+        if (string.Equals(formatted, current, StringComparison.Ordinal)) return;
+
+        int caret = tb.CaretIndex;
+        int digitsBeforeCaret = 0;
+        for (int i = 0; i < Math.Min(caret, current.Length); i++)
+        {
+            if (char.IsAsciiDigit(current[i])) digitsBeforeCaret++;
+        }
+
+        _formattingStormId = true;
+        try
+        {
+            tb.Text = formatted;
+            int newCaret = 0;
+            int seenDigits = 0;
+            while (newCaret < formatted.Length && seenDigits < digitsBeforeCaret)
+            {
+                if (char.IsAsciiDigit(formatted[newCaret])) seenDigits++;
+                newCaret++;
+            }
+            tb.CaretIndex = newCaret;
+        }
+        finally
+        {
+            _formattingStormId = false;
+        }
+    }
+
     private void BtnConsentAccept_Click(object sender, RoutedEventArgs e)
     {
         ModalConsent.Visibility = Visibility.Collapsed;
@@ -946,7 +989,7 @@ public partial class MainWindow : Window
 
     private void CmbMonitorSelect_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (_clientSession is null || CmbMonitorSelect.SelectedItem is not MonitorInfo m) return;
+        if (_suppressMonitorSelect || _clientSession is null || CmbMonitorSelect.SelectedItem is not MonitorInfo m) return;
         _ = _clientSession.SelectMonitorAsync(m.Index, _currentQuality);
         RebuildMonitorPills();
     }
@@ -1300,7 +1343,9 @@ public partial class MainWindow : Window
     {
         if (sender is Button { Tag: AddressGridRow row })
         {
-            string target = !string.IsNullOrWhiteSpace(row.Entry.StormId) ? row.Entry.StormId : row.Entry.HostOrIp;
+            string target = !string.IsNullOrWhiteSpace(row.Entry.StormId)
+                ? DeviceIdentity.FormatId(row.Entry.StormId)
+                : row.Entry.HostOrIp;
             TxtTargetInput.Text = target;
             _ = ConnectToTargetAsync(target);
         }

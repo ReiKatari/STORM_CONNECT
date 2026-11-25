@@ -373,7 +373,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.0", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.1", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -539,7 +539,7 @@ public sealed class HostServer : IAsyncDisposable
                 }
 
                 int elapsed = (int)sw.ElapsedMilliseconds;
-                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 110 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
+                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 90 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
                 if (elapsed < targetInterval)
                 {
                     try { await Task.Delay(targetInterval - elapsed, ct).ConfigureAwait(false); }
@@ -563,7 +563,12 @@ public sealed class HostServer : IAsyncDisposable
                             int mon = BitConverter.ToInt32(pkt.Payload, 0);
                             Interlocked.Exchange(ref activeMonitor, mon);
                             if (pkt.Payload.Length >= 8)
-                                targetQuality = Math.Clamp(BitConverter.ToInt32(pkt.Payload, 4), 25, 95);
+                            {
+                                int reqQ = BitConverter.ToInt32(pkt.Payload, 4);
+                                targetQuality = channel.Mode == ConnectionMode.WssRelay
+                                    ? Math.Clamp(reqQ, 25, 75)
+                                    : Math.Clamp(reqQ, 25, 95);
+                            }
                             encoder.Reset();
                             forceKeyFrame = true;
                         }

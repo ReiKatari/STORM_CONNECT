@@ -423,8 +423,22 @@ public sealed class ProtocolAndEngineTests
         await client.RequestFileListAsync("");
         var files = await filesTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.NotEmpty(files.Entries);
-        await Task.Delay(1500);
+        await Task.Delay(3200);
         Assert.True(client.IsConnected);
+        Assert.DoesNotContain(ProtocolConstants.PublicMqttWssBrokers, b => b.Contains("emqx", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void DeviceIdentity_FormatInputLive_GroupsEveryThreeDigitsWithoutTouchingIpsOrCodes()
+    {
+        Assert.Equal("596", DeviceIdentity.FormatInputLive("596"));
+        Assert.Equal("596 6", DeviceIdentity.FormatInputLive("5966"));
+        Assert.Equal("596 660", DeviceIdentity.FormatInputLive("596660"));
+        Assert.Equal("596 660 745", DeviceIdentity.FormatInputLive("596660745"));
+        Assert.Equal("596 660 745", DeviceIdentity.FormatInputLive("596 660745"));
+        Assert.Equal("192.168.1.50:7440", DeviceIdentity.FormatInputLive("192.168.1.50:7440"));
+        Assert.Equal("SC1-abc123", DeviceIdentity.FormatInputLive("SC1-abc123"));
+        Assert.Equal("1234567890", DeviceIdentity.FormatInputLive("1234567890"));
     }
 
     [Fact]

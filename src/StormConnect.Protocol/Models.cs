@@ -21,6 +21,23 @@ public sealed record DeviceIdentity(
     {
         return new string(input.Where(char.IsDigit).ToArray());
     }
+
+    public static string FormatInputLive(string raw)
+    {
+        if (string.IsNullOrEmpty(raw)) return raw;
+        foreach (char ch in raw)
+        {
+            if (!char.IsAsciiDigit(ch) && ch != ' ')
+                return raw;
+        }
+
+        var digits = new string(raw.Where(char.IsAsciiDigit).ToArray());
+        if (digits.Length == 0 || digits.Length > 9) return raw;
+
+        if (digits.Length <= 3) return digits;
+        if (digits.Length <= 6) return $"{digits[..3]} {digits[3..]}";
+        return $"{digits[..3]} {digits[3..6]} {digits[6..]}";
+    }
 }
 
 public sealed record MonitorInfo(
