@@ -2,7 +2,10 @@ using System.Globalization;
 
 namespace StormConnect.Desktop.Services;
 
-public sealed record LanguageOption(string Code, string DisplayName);
+public sealed record LanguageOption(string Code, string DisplayName)
+{
+    public override string ToString() => DisplayName;
+}
 
 /// <summary>
 /// Full 11-language STORM Ecosystem localization service.
@@ -59,7 +62,7 @@ public static class LocalizationService
     {
         var en = new Dictionary<string, string>
         {
-            ["AppSubtitle"] = "High-Speed Multi-Monitor Remote Desktop, File Transfer & Relay Suite",
+            ["AppSubtitle"] = "High-Speed Multi-Monitor Remote Desktop, File Transfer & Serverless Relay Suite",
             ["NavDashboard"] = "Connect",
             ["NavViewer"] = "Remote Session",
             ["NavFiles"] = "File Manager",
@@ -69,26 +72,60 @@ public static class LocalizationService
 
             ["MyStormId"] = "YOUR STORM ID",
             ["CopyId"] = "Copy ID",
+            ["CopyInvite"] = "Copy Invite Code",
             ["Copied"] = "Copied!",
             ["OneTimePin"] = "ONE-TIME PIN",
             ["RefreshPin"] = "Refresh PIN",
             ["IncomingStatus"] = "Incoming Access",
             ["RelayOnline"] = "Relay Online",
-            ["RelayOffline"] = "LAN / Direct Only",
+            ["RelayOffline"] = "Direct / Serverless Ready",
             ["ActiveIncoming"] = "Active Guests",
 
             ["QuickConnectTitle"] = "CONNECT TO REMOTE DEVICE",
-            ["TargetPlaceholder"] = "Enter 9-digit STORM ID or IP:Port...",
+            ["TargetPlaceholder"] = "Enter STORM ID, IP:Port, [IPv6]:Port or SC1-... Invite Code",
             ["ConnectBtn"] = "Connect",
             ["DisconnectBtn"] = "Disconnect",
+            ["ConnMethodLabel"] = "Connection Method",
+            ["MethodAuto"] = "Auto (LAN / IPv6 / UPnP / Relay)",
+            ["MethodDirect"] = "Direct LAN / VPN / IP (No Server)",
+            ["MethodInvite"] = "Direct Invite Code (SC1-... Serverless)",
+            ["MethodRelay"] = "Cloud / Local Relay (WSS)",
+            ["StatusReady"] = "Ready. Enter a 9-digit STORM ID, IP:Port, IPv6, or SC1-... Invite Code.",
+            ["StatusConnectingDirect"] = "Connecting directly (TCP/IPv6/VPN)...",
+            ["StatusConnectingLan"] = "Connecting via LAN Direct...",
+            ["StatusConnectingInvite"] = "Connecting via Serverless Invite Code...",
+            ["StatusConnectingRelay"] = "Connecting via STORM CONNECT Relay...",
+            ["StatusWaitingConsent"] = "Waiting for remote user approval...",
+            ["StatusConnected"] = "Connected",
+            ["StatusDisconnected"] = "Disconnected",
+            ["StatusConnFailed"] = "Connection failed",
+            ["StatusConnectFirst"] = "Connect to a remote device first to transfer dropped files.",
+            ["StatusWolSent"] = "Wake-on-LAN magic packet sent",
+            ["StatusPwdSaved"] = "Unattended password saved (DPAPI + PBKDF2).",
+            ["StatusPwdCleared"] = "Unattended password cleared.",
+            ["StatusSavedShot"] = "Saved screenshot",
+            ["ServerlessCardTitle"] = "DIRECT SERVERLESS ACCESS (NO SERVER REQUIRED)",
+            ["RefreshNetMap"] = "Refresh NAT / UPnP",
+
             ["LanDevicesTitle"] = "DISCOVERED ON LOCAL NETWORK (LAN)",
             ["NoLanDevices"] = "Scanning local network for STORM CONNECT devices...",
             ["LiveTelemetry"] = "LIVE PERFORMANCE TELEMETRY",
+            ["UnitMs"] = "ms",
+            ["UnitMbps"] = "Mbps",
+            ["LabelDelta"] = "Delta",
+            ["LabelRtt"] = "RTT",
+            ["LabelFps"] = "FPS",
 
+            ["MonitorNone"] = "Monitor: No active session",
             ["SelectMonitor"] = "Monitor",
             ["AllMonitors"] = "All Monitors",
-            ["Quality"] = "Quality",
+            ["Qual90"] = "90% Ultra",
+            ["Qual75"] = "75% Balanced",
+            ["Qual55"] = "55% Fast",
+            ["Qual35"] = "35% Low-BW",
             ["AudioToggle"] = "Audio",
+            ["StateOn"] = "ON",
+            ["StateOff"] = "OFF",
             ["Fullscreen"] = "Fullscreen",
             ["CtrlAltDel"] = "TaskMgr",
             ["LockRemote"] = "Lock PC",
@@ -96,6 +133,7 @@ public static class LocalizationService
             ["AltTab"] = "Alt+Tab",
             ["Screenshot"] = "Screenshot",
             ["Chat"] = "Session Chat",
+            ["ViewerIdle"] = "Idle",
             ["NoActiveSession"] = "No active remote session. Connect from the Dashboard or Address Book.",
             ["DropFilesHint"] = "Drag & Drop files onto the remote screen to upload immediately",
 
@@ -107,6 +145,10 @@ public static class LocalizationService
             ["Download"] = "<- Download",
             ["NewFolder"] = "New Folder",
             ["Delete"] = "Delete",
+            ["FileReady"] = "Ready for file transfer (Drag & Drop supported)",
+            ["FileUploading"] = "Uploading",
+            ["FileDownloading"] = "Downloading",
+            ["FileError"] = "Error",
             ["ColName"] = "NAME",
             ["ColSize"] = "SIZE",
             ["ColModified"] = "MODIFIED",
@@ -120,13 +162,22 @@ public static class LocalizationService
             ["ColActions"] = "ACTIONS",
             ["AddDevice"] = "Add Device",
             ["WakeOnLan"] = "Wake",
+            ["DeleteBtn"] = "Delete",
+            ["HintAlias"] = "Device Alias",
+            ["HintStormId"] = "STORM ID (9 digits)",
+            ["HintHost"] = "Host / IP / SC1 Invite Code",
+            ["HintMac"] = "MAC Address (XX:XX:XX:XX:XX:XX)",
+            ["HintGroup"] = "Group",
 
             ["RelayServerUrl"] = "STORM CONNECT Relay URL (WSS)",
             ["DirectTcpPort"] = "Direct LAN / TCP Port",
             ["EnableRelay"] = "Enable Cloud Relay Fallback",
+            ["SaveNetworkBtn"] = "Save Network Settings",
             ["EmbeddedRelay"] = "Run Embedded Team Relay Hub on this PC",
             ["StartHub"] = "Start Local Hub",
             ["StopHub"] = "Stop Local Hub",
+            ["HubStopped"] = "Stopped",
+            ["HubListening"] = "Listening on",
             ["DeployNote"] = "Use the included deploy/ folder (Docker / systemd / Nginx) to host your private relay on any domain.",
 
             ["UnattendedPwd"] = "Unattended Access Password",
@@ -154,6 +205,10 @@ public static class LocalizationService
             ["TipAbout"] = "About STORM CONNECT",
 
             ["ConsentTitle"] = "INCOMING CONNECTION REQUEST",
+            ["ConsentPermControl"] = "Allow Mouse & Keyboard Control",
+            ["ConsentPermClipboard"] = "Allow Clipboard Sync",
+            ["ConsentPermFiles"] = "Allow File Transfer",
+            ["ConsentPermAudio"] = "Allow Audio",
             ["AcceptFull"] = "Accept Full Control",
             ["AcceptView"] = "View Only",
             ["Decline"] = "Decline",
@@ -166,7 +221,8 @@ public static class LocalizationService
             ["UpdateBtn"] = "Update",
             ["LaterBtn"] = "Later",
             ["UpToDateMsg"] = "You have the latest version installed",
-            ["AboutDesc"] = "High-speed remote desktop, multi-monitor streaming, file manager, audio, clipboard sync, Wake-on-LAN and self-hosted encrypted relay for the STORM ecosystem.",
+            ["UpdateNewAvailable"] = "New release available.",
+            ["AboutDesc"] = "High-speed remote desktop, multi-monitor streaming, file manager, audio, clipboard sync, Wake-on-LAN, serverless UPnP/IPv6/STUN/Invite direct connections and self-hosted encrypted relay for the STORM ecosystem.",
 
             ["TrayRestore"] = "Open STORM CONNECT",
             ["TrayAbout"] = "About",
@@ -175,7 +231,7 @@ public static class LocalizationService
 
         var ru = new Dictionary<string, string>(en)
         {
-            ["AppSubtitle"] = "Высокоскоростной многомониторный удалённый рабочий стол, передача файлов и ретранслятор",
+            ["AppSubtitle"] = "Высокоскоростной многомониторный удалённый рабочий стол, файлы и прямая связь без сервера",
             ["NavDashboard"] = "Подключение",
             ["NavViewer"] = "Удалённый экран",
             ["NavFiles"] = "Файловый менеджер",
@@ -185,26 +241,60 @@ public static class LocalizationService
 
             ["MyStormId"] = "ВАШ STORM ID",
             ["CopyId"] = "Копировать ID",
+            ["CopyInvite"] = "Копировать код доступа",
             ["Copied"] = "Скопировано!",
             ["OneTimePin"] = "ОДНОРАЗОВЫЙ PIN",
             ["RefreshPin"] = "Обновить PIN",
             ["IncomingStatus"] = "Входящий доступ",
             ["RelayOnline"] = "Ретранслятор онлайн",
-            ["RelayOffline"] = "Только LAN / Прямой IP",
+            ["RelayOffline"] = "Прямой режим (без сервера)",
             ["ActiveIncoming"] = "Активные гости",
 
             ["QuickConnectTitle"] = "ПОДКЛЮЧЕНИЕ К УДАЛЁННОМУ УСТРОЙСТВУ",
-            ["TargetPlaceholder"] = "Введите 9-значный STORM ID или IP:Порт...",
+            ["TargetPlaceholder"] = "STORM ID, IP:Порт, [IPv6]:Порт или код SC1-...",
             ["ConnectBtn"] = "Подключиться",
             ["DisconnectBtn"] = "Отключить",
+            ["ConnMethodLabel"] = "Метод подключения",
+            ["MethodAuto"] = "Авто (LAN / IPv6 / UPnP / Relay)",
+            ["MethodDirect"] = "Прямой LAN / VPN / IP (без сервера)",
+            ["MethodInvite"] = "Код приглашения (SC1-... без сервера)",
+            ["MethodRelay"] = "Облачный / локальный ретранслятор (WSS)",
+            ["StatusReady"] = "Готово. Введите 9-значный STORM ID, IP:Порт, IPv6 или код приглашения SC1-...",
+            ["StatusConnectingDirect"] = "Прямое подключение (TCP/IPv6/VPN)...",
+            ["StatusConnectingLan"] = "Подключение по локальной сети (LAN Direct)...",
+            ["StatusConnectingInvite"] = "Подключение по прямому коду приглашения (без сервера)...",
+            ["StatusConnectingRelay"] = "Подключение через ретранслятор STORM CONNECT...",
+            ["StatusWaitingConsent"] = "Ожидание подтверждения от пользователя...",
+            ["StatusConnected"] = "Подключено",
+            ["StatusDisconnected"] = "Отключено",
+            ["StatusConnFailed"] = "Ошибка подключения",
+            ["StatusConnectFirst"] = "Сначала подключитесь к устройству для передачи файлов.",
+            ["StatusWolSent"] = "Пакет Wake-on-LAN отправлен на",
+            ["StatusPwdSaved"] = "Пароль постоянного доступа сохранён (DPAPI + PBKDF2).",
+            ["StatusPwdCleared"] = "Пароль постоянного доступа сброшен.",
+            ["StatusSavedShot"] = "Снимок экрана сохранён",
+            ["ServerlessCardTitle"] = "ПРЯМОЙ ДОСТУП БЕЗ СЕРВЕРА (LAN / VPN / IPv6 / UPnP / STUN)",
+            ["RefreshNetMap"] = "Обновить NAT / UPnP",
+
             ["LanDevicesTitle"] = "ОБНАРУЖЕННЫЕ УСТРОЙСТВА В ЛОКАЛЬНОЙ СЕТИ (LAN)",
             ["NoLanDevices"] = "Поиск устройств STORM CONNECT в локальной сети...",
             ["LiveTelemetry"] = "ЖИВАЯ ТЕЛЕМЕТРИЯ ПРОИЗВОДИТЕЛЬНОСТИ",
+            ["UnitMs"] = "мс",
+            ["UnitMbps"] = "Мбит/с",
+            ["LabelDelta"] = "Дельта",
+            ["LabelRtt"] = "Пинг",
+            ["LabelFps"] = "Кадр/с",
 
+            ["MonitorNone"] = "Монитор: нет активной сессии",
             ["SelectMonitor"] = "Монитор",
             ["AllMonitors"] = "Все мониторы",
-            ["Quality"] = "Качество",
+            ["Qual90"] = "90% Ультра",
+            ["Qual75"] = "75% Баланс",
+            ["Qual55"] = "55% Быстро",
+            ["Qual35"] = "35% Эконом",
             ["AudioToggle"] = "Звук",
+            ["StateOn"] = "ВКЛ",
+            ["StateOff"] = "ВЫКЛ",
             ["Fullscreen"] = "Во весь экран",
             ["CtrlAltDel"] = "Диспетчер",
             ["LockRemote"] = "Блокировка",
@@ -212,6 +302,7 @@ public static class LocalizationService
             ["AltTab"] = "Alt+Tab",
             ["Screenshot"] = "Снимок",
             ["Chat"] = "Чат сессии",
+            ["ViewerIdle"] = "Ожидание",
             ["NoActiveSession"] = "Нет активной удалённой сессии. Подключитесь с главного экрана или из Адресной книги.",
             ["DropFilesHint"] = "Перетащите файлы прямо на удалённый экран для мгновенной отправки",
 
@@ -223,6 +314,10 @@ public static class LocalizationService
             ["Download"] = "<- Скачать",
             ["NewFolder"] = "Новая папка",
             ["Delete"] = "Удалить",
+            ["FileReady"] = "Готово к передаче файлов (поддерживается Drag-and-Drop)",
+            ["FileUploading"] = "Отправка",
+            ["FileDownloading"] = "Скачивание",
+            ["FileError"] = "Ошибка",
             ["ColName"] = "ИМЯ",
             ["ColSize"] = "РАЗМЕР",
             ["ColModified"] = "ИЗМЕНЁН",
@@ -236,13 +331,22 @@ public static class LocalizationService
             ["ColActions"] = "ДЕЙСТВИЯ",
             ["AddDevice"] = "Добавить устройство",
             ["WakeOnLan"] = "Разбудить",
+            ["DeleteBtn"] = "Удалить",
+            ["HintAlias"] = "Название устройства",
+            ["HintStormId"] = "STORM ID (9 цифр)",
+            ["HintHost"] = "Хост / IP / Код SC1-...",
+            ["HintMac"] = "MAC-адрес (XX:XX:XX:XX:XX:XX)",
+            ["HintGroup"] = "Группа",
 
             ["RelayServerUrl"] = "Адрес ретранслятора STORM CONNECT (WSS)",
             ["DirectTcpPort"] = "Прямой порт LAN / TCP",
             ["EnableRelay"] = "Использовать облачный ретранслятор",
+            ["SaveNetworkBtn"] = "Сохранить настройки сети",
             ["EmbeddedRelay"] = "Встроенный командный ретранслятор на этом ПК",
             ["StartHub"] = "Запустить узел",
             ["StopHub"] = "Остановить узел",
+            ["HubStopped"] = "Остановлен",
+            ["HubListening"] = "Активен на",
             ["DeployNote"] = "Используйте папку deploy/ (Docker / systemd / Nginx) для развёртывания собственного узла на вашем сервере.",
 
             ["UnattendedPwd"] = "Пароль постоянного неконтролируемого доступа",
@@ -270,6 +374,10 @@ public static class LocalizationService
             ["TipAbout"] = "Информация о программе STORM CONNECT",
 
             ["ConsentTitle"] = "ЗАПРОС ВХОДЯЩЕГО ПОДКЛЮЧЕНИЯ",
+            ["ConsentPermControl"] = "Разрешить управление мышью и клавиатурой",
+            ["ConsentPermClipboard"] = "Разрешить обмен буфером обмена",
+            ["ConsentPermFiles"] = "Разрешить передачу файлов",
+            ["ConsentPermAudio"] = "Разрешить передачу звука",
             ["AcceptFull"] = "Разрешить управление",
             ["AcceptView"] = "Только просмотр",
             ["Decline"] = "Отклонить",
@@ -282,7 +390,8 @@ public static class LocalizationService
             ["UpdateBtn"] = "Обновить",
             ["LaterBtn"] = "Позже",
             ["UpToDateMsg"] = "У вас установлена актуальная версия",
-            ["AboutDesc"] = "Быстрый удалённый рабочий стол, многомониторный захват DXGI, передача файлов, звук, буфер обмена, Wake-on-LAN и собственный шифрованный ретранслятор экосистемы STORM.",
+            ["UpdateNewAvailable"] = "Доступна новая версия.",
+            ["AboutDesc"] = "Быстрый удалённый рабочий стол, многомониторный захват DXGI, передача файлов, звук, буфер обмена, Wake-on-LAN, прямое подключение без сервера (LAN/VPN/IPv6/UPnP/STUN/SC1) и собственный шифрованный ретранслятор экосистемы STORM.",
 
             ["TrayRestore"] = "Развернуть STORM CONNECT",
             ["TrayAbout"] = "О программе",
@@ -291,83 +400,99 @@ public static class LocalizationService
 
         var de = Merge(en, new()
         {
-            ["AppSubtitle"] = "Schneller Multi-Monitor-Fernzugriff, Dateitransfer & Relay",
+            ["AppSubtitle"] = "Schneller Multi-Monitor-Fernzugriff, Dateitransfer & Direktverbindung",
             ["NavDashboard"] = "Verbinden", ["NavViewer"] = "Fernsitzung", ["NavFiles"] = "Dateimanager",
             ["NavAddressBook"] = "Adressbuch", ["NavNetwork"] = "Netzwerk & Relay", ["NavSettings"] = "Einstellungen",
-            ["CopyId"] = "ID kopieren", ["Copied"] = "Kopiert!", ["RefreshPin"] = "PIN erneuern",
-            ["ConnectBtn"] = "Verbinden", ["DisconnectBtn"] = "Trennen", ["AllMonitors"] = "Alle Monitore",
-            ["Quality"] = "Qualitat", ["AudioToggle"] = "Ton", ["Fullscreen"] = "Vollbild",
+            ["CopyId"] = "ID kopieren", ["CopyInvite"] = "Einladungscode kopieren", ["Copied"] = "Kopiert!",
+            ["RefreshPin"] = "PIN erneuern", ["ConnectBtn"] = "Verbinden", ["DisconnectBtn"] = "Trennen",
+            ["AllMonitors"] = "Alle Monitore", ["MonitorNone"] = "Monitor: Keine Sitzung",
+            ["Qual90"] = "90% Ultra", ["Qual75"] = "75% Ausgewogen", ["Qual55"] = "55% Schnell", ["Qual35"] = "35% Sparsam",
+            ["AudioToggle"] = "Ton", ["StateOn"] = "EIN", ["StateOff"] = "AUS", ["ViewerIdle"] = "Bereit",
+            ["Fullscreen"] = "Vollbild", ["CtrlAltDel"] = "TaskMgr", ["LockRemote"] = "Sperren", ["Screenshot"] = "Bildschirmfoto", ["Chat"] = "Chat",
             ["ColName"] = "NAME", ["ColSize"] = "GROSSE", ["ColModified"] = "GEANDERT", ["ColType"] = "TYP",
-            ["ColAlias"] = "GERATENAME", ["ColActions"] = "AKTIONEN", ["AddDevice"] = "Hinzufugen",
-            ["CheckUpdates"] = "Updates", ["About"] = "Uber", ["UpdateBtn"] = "Aktualisieren",
+            ["ColAlias"] = "GERATENAME", ["ColActions"] = "AKTIONEN", ["AddDevice"] = "Hinzufugen", ["WakeOnLan"] = "Wecken",
+            ["SaveNetworkBtn"] = "Speichern", ["CheckUpdates"] = "Updates", ["About"] = "Uber", ["UpdateBtn"] = "Aktualisieren",
             ["Cancel"] = "Abbrechen", ["Close"] = "Schliessen", ["TrayRestore"] = "STORM CONNECT offnen",
             ["TrayAbout"] = "Uber", ["TrayExit"] = "Beenden"
         });
 
         var fr = Merge(en, new()
         {
-            ["AppSubtitle"] = "Bureau a distance multi-ecrans rapide, transfert de fichiers et relais",
+            ["AppSubtitle"] = "Bureau a distance multi-ecrans rapide, fichiers et connexion directe",
             ["NavDashboard"] = "Connexion", ["NavViewer"] = "Session distante", ["NavFiles"] = "Fichiers",
             ["NavAddressBook"] = "Carnet d'adresses", ["NavNetwork"] = "Reseau & Relais", ["NavSettings"] = "Parametres",
-            ["CopyId"] = "Copier ID", ["Copied"] = "Copie!", ["RefreshPin"] = "Nouveau PIN",
-            ["ConnectBtn"] = "Connecter", ["DisconnectBtn"] = "Deconnecter", ["AllMonitors"] = "Tous les ecrans",
-            ["Quality"] = "Qualite", ["AudioToggle"] = "Audio", ["Fullscreen"] = "Plein ecran",
+            ["CopyId"] = "Copier ID", ["CopyInvite"] = "Copier code d'acces", ["Copied"] = "Copie!",
+            ["RefreshPin"] = "Nouveau PIN", ["ConnectBtn"] = "Connecter", ["DisconnectBtn"] = "Deconnecter",
+            ["AllMonitors"] = "Tous les ecrans", ["MonitorNone"] = "Ecran : aucune session",
+            ["Qual90"] = "90% Ultra", ["Qual75"] = "75% Equilibre", ["Qual55"] = "55% Rapide", ["Qual35"] = "35% Eco",
+            ["AudioToggle"] = "Audio", ["StateOn"] = "ON", ["StateOff"] = "OFF", ["ViewerIdle"] = "Inactif",
+            ["Fullscreen"] = "Plein ecran", ["LockRemote"] = "Verrouiller", ["Screenshot"] = "Capture", ["Chat"] = "Discussion",
             ["ColName"] = "NOM", ["ColSize"] = "TAILLE", ["ColModified"] = "MODIFIE", ["ColType"] = "TYPE",
-            ["ColAlias"] = "NOM D'APPAREIL", ["ColActions"] = "ACTIONS", ["AddDevice"] = "Ajouter",
-            ["CheckUpdates"] = "Mises a jour", ["About"] = "A propos", ["UpdateBtn"] = "Mettre a jour",
+            ["ColAlias"] = "NOM D'APPAREIL", ["ColActions"] = "ACTIONS", ["AddDevice"] = "Ajouter", ["WakeOnLan"] = "Reveiller",
+            ["SaveNetworkBtn"] = "Enregistrer", ["CheckUpdates"] = "Mises a jour", ["About"] = "A propos", ["UpdateBtn"] = "Mettre a jour",
             ["Cancel"] = "Annuler", ["Close"] = "Fermer", ["TrayRestore"] = "Ouvrir STORM CONNECT",
             ["TrayAbout"] = "A propos", ["TrayExit"] = "Quitter"
         });
 
         var es = Merge(en, new()
         {
-            ["AppSubtitle"] = "Escritorio remoto multimonitor rapido, archivos y retransmision",
+            ["AppSubtitle"] = "Escritorio remoto multimonitor rapido, archivos y conexion directa",
             ["NavDashboard"] = "Conectar", ["NavViewer"] = "Sesion remota", ["NavFiles"] = "Archivos",
             ["NavAddressBook"] = "Libreta", ["NavNetwork"] = "Red y Relay", ["NavSettings"] = "Ajustes",
-            ["CopyId"] = "Copiar ID", ["Copied"] = "Copiado!", ["ConnectBtn"] = "Conectar",
-            ["DisconnectBtn"] = "Desconectar", ["AllMonitors"] = "Todos los monitores", ["Quality"] = "Calidad",
+            ["CopyId"] = "Copiar ID", ["CopyInvite"] = "Copiar invitacion", ["Copied"] = "Copiado!",
+            ["ConnectBtn"] = "Conectar", ["DisconnectBtn"] = "Desconectar",
+            ["AllMonitors"] = "Todos los monitores", ["MonitorNone"] = "Monitor: sin sesion",
+            ["Qual90"] = "90% Ultra", ["Qual75"] = "75% Balance", ["Qual55"] = "55% Rapido", ["Qual35"] = "35% Bajo",
+            ["StateOn"] = "SI", ["StateOff"] = "NO", ["ViewerIdle"] = "En espera",
             ["ColName"] = "NOMBRE", ["ColSize"] = "TAMANO", ["ColModified"] = "MODIFICADO", ["ColType"] = "TIPO",
-            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "ACCIONES", ["CheckUpdates"] = "Actualizaciones",
-            ["About"] = "Acerca de", ["UpdateBtn"] = "Actualizar", ["Cancel"] = "Cancelar",
+            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "ACCIONES", ["SaveNetworkBtn"] = "Guardar",
+            ["CheckUpdates"] = "Actualizaciones", ["About"] = "Acerca de", ["UpdateBtn"] = "Actualizar", ["Cancel"] = "Cancelar",
             ["Close"] = "Cerrar", ["TrayRestore"] = "Abrir STORM CONNECT", ["TrayAbout"] = "Acerca de", ["TrayExit"] = "Salir"
         });
 
         var it = Merge(en, new()
         {
-            ["AppSubtitle"] = "Desktop remoto multi-monitor veloce, trasferimento file e relay",
+            ["AppSubtitle"] = "Desktop remoto multi-monitor veloce, file e connessione diretta",
             ["NavDashboard"] = "Connetti", ["NavViewer"] = "Sessione remota", ["NavFiles"] = "File",
             ["NavAddressBook"] = "Rubrica", ["NavNetwork"] = "Rete e Relay", ["NavSettings"] = "Impostazioni",
-            ["CopyId"] = "Copia ID", ["Copied"] = "Copiato!", ["ConnectBtn"] = "Connetti",
-            ["DisconnectBtn"] = "Disconnetti", ["AllMonitors"] = "Tutti i monitor", ["Quality"] = "Qualita",
+            ["CopyId"] = "Copia ID", ["CopyInvite"] = "Copia invito", ["Copied"] = "Copiato!",
+            ["ConnectBtn"] = "Connetti", ["DisconnectBtn"] = "Disconnetti",
+            ["AllMonitors"] = "Tutti i monitor", ["MonitorNone"] = "Monitor: nessuna sessione",
+            ["Qual90"] = "90% Ultra", ["Qual75"] = "75% Bilanciato", ["Qual55"] = "55% Veloce", ["Qual35"] = "35% Basso",
+            ["StateOn"] = "ON", ["StateOff"] = "OFF", ["ViewerIdle"] = "Inattivo",
             ["ColName"] = "NOME", ["ColSize"] = "DIMENSIONE", ["ColModified"] = "MODIFICATO", ["ColType"] = "TIPO",
-            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "AZIONI", ["CheckUpdates"] = "Aggiornamenti",
-            ["About"] = "Informazioni", ["UpdateBtn"] = "Aggiorna", ["Cancel"] = "Annulla",
+            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "AZIONI", ["SaveNetworkBtn"] = "Salva",
+            ["CheckUpdates"] = "Aggiornamenti", ["About"] = "Informazioni", ["UpdateBtn"] = "Aggiorna", ["Cancel"] = "Annulla",
             ["Close"] = "Chiudi", ["TrayRestore"] = "Apri STORM CONNECT", ["TrayAbout"] = "Informazioni", ["TrayExit"] = "Esci"
         });
 
         var pt = Merge(en, new()
         {
-            ["AppSubtitle"] = "Acesso remoto multimonitor rapido, arquivos e retransmissao",
+            ["AppSubtitle"] = "Acesso remoto multimonitor rapido, arquivos e conexao direta",
             ["NavDashboard"] = "Conectar", ["NavViewer"] = "Sessao remota", ["NavFiles"] = "Arquivos",
             ["NavAddressBook"] = "Contatos", ["NavNetwork"] = "Rede e Relay", ["NavSettings"] = "Configuracoes",
-            ["CopyId"] = "Copiar ID", ["Copied"] = "Copiado!", ["ConnectBtn"] = "Conectar",
-            ["DisconnectBtn"] = "Desconectar", ["AllMonitors"] = "Todos os monitores", ["Quality"] = "Qualidade",
+            ["CopyId"] = "Copiar ID", ["CopyInvite"] = "Copiar convite", ["Copied"] = "Copiado!",
+            ["ConnectBtn"] = "Conectar", ["DisconnectBtn"] = "Desconectar",
+            ["AllMonitors"] = "Todos os monitores", ["MonitorNone"] = "Monitor: sem sessao",
+            ["Qual90"] = "90% Ultra", ["Qual75"] = "75% Equilibrado", ["Qual55"] = "55% Rapido", ["Qual35"] = "35% Baixo",
+            ["StateOn"] = "ON", ["StateOff"] = "OFF", ["ViewerIdle"] = "Aguardando",
             ["ColName"] = "NOME", ["ColSize"] = "TAMANHO", ["ColModified"] = "MODIFICADO", ["ColType"] = "TIPO",
-            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "ACOES", ["CheckUpdates"] = "Atualizacoes",
-            ["About"] = "Sobre", ["UpdateBtn"] = "Atualizar", ["Cancel"] = "Cancelar",
+            ["ColAlias"] = "DISPOSITIVO", ["ColActions"] = "ACOES", ["SaveNetworkBtn"] = "Salvar",
+            ["CheckUpdates"] = "Atualizacoes", ["About"] = "Sobre", ["UpdateBtn"] = "Atualizar", ["Cancel"] = "Cancelar",
             ["Close"] = "Fechar", ["TrayRestore"] = "Abrir STORM CONNECT", ["TrayAbout"] = "Sobre", ["TrayExit"] = "Sair"
         });
 
         var zh = Merge(en, new()
         {
-            ["AppSubtitle"] = "高速多显示器远程桌面、文件传输与加密中继",
+            ["AppSubtitle"] = "高速多显示器远程桌面、文件传输与无服务器直连",
             ["NavDashboard"] = "连接", ["NavViewer"] = "远程桌面", ["NavFiles"] = "文件管理",
             ["NavAddressBook"] = "地址簿", ["NavNetwork"] = "网络与中继", ["NavSettings"] = "设置与安全",
-            ["CopyId"] = "复制 ID", ["Copied"] = "已复制!", ["RefreshPin"] = "刷新 PIN",
-            ["ConnectBtn"] = "连接", ["DisconnectBtn"] = "断开", ["AllMonitors"] = "所有显示器",
-            ["Quality"] = "画质", ["AudioToggle"] = "音频", ["Fullscreen"] = "全屏",
+            ["CopyId"] = "复制 ID", ["CopyInvite"] = "复制邀请码", ["Copied"] = "已复制!", ["RefreshPin"] = "刷新 PIN",
+            ["ConnectBtn"] = "连接", ["DisconnectBtn"] = "断开", ["AllMonitors"] = "所有显示器", ["MonitorNone"] = "显示器: 未连接",
+            ["Qual90"] = "90% 超清", ["Qual75"] = "75% 均衡", ["Qual55"] = "55% 极速", ["Qual35"] = "35% 省流",
+            ["AudioToggle"] = "音频", ["StateOn"] = "开", ["StateOff"] = "关", ["Fullscreen"] = "全屏", ["ViewerIdle"] = "空闲",
             ["ColName"] = "名称", ["ColSize"] = "大小", ["ColModified"] = "修改时间", ["ColType"] = "类型",
-            ["ColAlias"] = "设备名称", ["ColActions"] = "操作", ["AddDevice"] = "添加设备",
+            ["ColAlias"] = "设备名称", ["ColActions"] = "操作", ["AddDevice"] = "添加设备", ["SaveNetworkBtn"] = "保存设置",
             ["CheckUpdates"] = "检查更新", ["About"] = "关于", ["UpdateBtn"] = "更新",
             ["Cancel"] = "取消", ["Close"] = "关闭", ["TrayRestore"] = "打开 STORM CONNECT",
             ["TrayAbout"] = "关于", ["TrayExit"] = "退出"
@@ -375,14 +500,15 @@ public static class LocalizationService
 
         var ko = Merge(en, new()
         {
-            ["AppSubtitle"] = "고속 다중 모니터 원격 데스크톱, 파일 전송 및 암호화 릴레이",
+            ["AppSubtitle"] = "고속 다중 모니터 원격 데스크톱, 파일 전송 및 무서버 직접 연결",
             ["NavDashboard"] = "연결", ["NavViewer"] = "원격 화면", ["NavFiles"] = "파일 관리자",
             ["NavAddressBook"] = "주소록", ["NavNetwork"] = "네트워크 및 릴레이", ["NavSettings"] = "설정 및 보안",
-            ["CopyId"] = "ID 복사", ["Copied"] = "복사됨!", ["RefreshPin"] = "PIN 새로고침",
-            ["ConnectBtn"] = "연결", ["DisconnectBtn"] = "연결 해제", ["AllMonitors"] = "모든 모니터",
-            ["Quality"] = "품질", ["AudioToggle"] = "오디오", ["Fullscreen"] = "전체 화면",
+            ["CopyId"] = "ID 복사", ["CopyInvite"] = "초대 코드 복사", ["Copied"] = "복사됨!", ["RefreshPin"] = "PIN 새로고침",
+            ["ConnectBtn"] = "연결", ["DisconnectBtn"] = "연결 해제", ["AllMonitors"] = "모든 모니터", ["MonitorNone"] = "모니터: 연결 없음",
+            ["Qual90"] = "90% 최고화질", ["Qual75"] = "75% 균형", ["Qual55"] = "55% 빠름", ["Qual35"] = "35% 절약",
+            ["AudioToggle"] = "오디오", ["StateOn"] = "켜짐", ["StateOff"] = "꺼짐", ["Fullscreen"] = "전체 화면", ["ViewerIdle"] = "대기 중",
             ["ColName"] = "이름", ["ColSize"] = "크기", ["ColModified"] = "수정됨", ["ColType"] = "유형",
-            ["ColAlias"] = "장치 이름", ["ColActions"] = "작업", ["AddDevice"] = "장치 추가",
+            ["ColAlias"] = "장치 이름", ["ColActions"] = "작업", ["AddDevice"] = "장치 추가", ["SaveNetworkBtn"] = "저장",
             ["CheckUpdates"] = "업데이트", ["About"] = "정보", ["UpdateBtn"] = "업데이트",
             ["Cancel"] = "취소", ["Close"] = "닫기", ["TrayRestore"] = "STORM CONNECT 열기",
             ["TrayAbout"] = "정보", ["TrayExit"] = "종료"
@@ -390,14 +516,15 @@ public static class LocalizationService
 
         var ja = Merge(en, new()
         {
-            ["AppSubtitle"] = "高速マルチモニターリモートデスクトップ・ファイル転送・暗号化リレー",
+            ["AppSubtitle"] = "高速マルチモニターリモートデスクトップ・ファイル転送・直接接続",
             ["NavDashboard"] = "接続", ["NavViewer"] = "リモート画面", ["NavFiles"] = "ファイル管理",
             ["NavAddressBook"] = "アドレス帳", ["NavNetwork"] = "ネットワークとリレー", ["NavSettings"] = "設定とセキュリティ",
-            ["CopyId"] = "IDをコピー", ["Copied"] = "コピー完了!", ["RefreshPin"] = "PIN更新",
-            ["ConnectBtn"] = "接続", ["DisconnectBtn"] = "切断", ["AllMonitors"] = "すべてのモニター",
-            ["Quality"] = "画質", ["AudioToggle"] = "音声", ["Fullscreen"] = "全画面",
+            ["CopyId"] = "IDをコピー", ["CopyInvite"] = "招待コードをコピー", ["Copied"] = "コピー完了!", ["RefreshPin"] = "PIN更新",
+            ["ConnectBtn"] = "接続", ["DisconnectBtn"] = "切断", ["AllMonitors"] = "すべてのモニター", ["MonitorNone"] = "モニター: 未接続",
+            ["Qual90"] = "90% 高画質", ["Qual75"] = "75% バランス", ["Qual55"] = "55% 高速", ["Qual35"] = "35% 低帯域",
+            ["AudioToggle"] = "音声", ["StateOn"] = "ON", ["StateOff"] = "OFF", ["Fullscreen"] = "全画面", ["ViewerIdle"] = "待機中",
             ["ColName"] = "名前", ["ColSize"] = "サイズ", ["ColModified"] = "更新日時", ["ColType"] = "種類",
-            ["ColAlias"] = "デバイス名", ["ColActions"] = "操作", ["AddDevice"] = "デバイス追加",
+            ["ColAlias"] = "デバイス名", ["ColActions"] = "操作", ["AddDevice"] = "デバイス追加", ["SaveNetworkBtn"] = "保存",
             ["CheckUpdates"] = "更新確認", ["About"] = "情報", ["UpdateBtn"] = "更新",
             ["Cancel"] = "キャンセル", ["Close"] = "閉じる", ["TrayRestore"] = "STORM CONNECT を開く",
             ["TrayAbout"] = "情報", ["TrayExit"] = "終了"
@@ -405,14 +532,16 @@ public static class LocalizationService
 
         var hi = Merge(en, new()
         {
-            ["AppSubtitle"] = "तेज मल्टी-मॉनिटर रिमोट डेस्कटॉप, फाइल ट्रांसफर और रिले",
+            ["AppSubtitle"] = "तेज मल्टी-मॉनिटर रिमोट डेस्कटॉप, फाइल ट्रांसफर और डायरेक्ट कनेक्शन",
             ["NavDashboard"] = "कनेक्ट", ["NavViewer"] = "रिमोट स्क्रीन", ["NavFiles"] = "फाइल प्रबंधक",
             ["NavAddressBook"] = "एड्रेस बुक", ["NavNetwork"] = "नेटवर्क और रिले", ["NavSettings"] = "सेटिंग्स",
-            ["CopyId"] = "ID कॉपी करें", ["Copied"] = "कॉपी हो गया!", ["ConnectBtn"] = "कनेक्ट",
-            ["DisconnectBtn"] = "डिस्कनेक्ट", ["AllMonitors"] = "सभी मॉनिटर", ["Quality"] = "गुणवत्ता",
+            ["CopyId"] = "ID कॉपी करें", ["CopyInvite"] = "इनवाइट कोड कॉपी करें", ["ConnectBtn"] = "कनेक्ट",
+            ["DisconnectBtn"] = "डिस्कनेक्ट", ["AllMonitors"] = "सभी मॉनिटर", ["MonitorNone"] = "मॉनिटर: कोई सत्र नहीं",
+            ["Qual90"] = "90% अल्ट्रा", ["Qual75"] = "75% संतुलित", ["Qual55"] = "55% तेज", ["Qual35"] = "35% कम डेटा",
+            ["AudioToggle"] = "ऑडियो", ["StateOn"] = "चालू", ["StateOff"] = "बंद", ["ViewerIdle"] = "प्रतीक्षा",
             ["ColName"] = "नाम", ["ColSize"] = "आकार", ["ColModified"] = "संशोधित", ["ColType"] = "प्रकार",
-            ["ColAlias"] = "डिवाइस नाम", ["ColActions"] = "कार्रवाई", ["CheckUpdates"] = "अपडेट",
-            ["About"] = "परिचय", ["UpdateBtn"] = "अपडेट करें", ["Cancel"] = "रद्द करें",
+            ["ColAlias"] = "डिवाइस नाम", ["ColActions"] = "कार्रवाई", ["SaveNetworkBtn"] = "सहेजें",
+            ["CheckUpdates"] = "अपडेट", ["About"] = "परिचय", ["UpdateBtn"] = "अपडेट करें", ["Cancel"] = "रद्द करें",
             ["Close"] = "बंद करें", ["TrayRestore"] = "STORM CONNECT खोलें",
             ["TrayAbout"] = "परिचय", ["TrayExit"] = "बाहर निकलें"
         });

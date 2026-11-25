@@ -8,10 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <NoWarn>WFO1000</NoWarn>
     <ApplicationIcon>..\..\AppIcon.ico</ApplicationIcon>
-    <AssemblyName>STORM_CONNECT_1.0.0_Setup</AssemblyName>
-    <Version>1.0.0</Version>
-    <AssemblyVersion>1.0.0.0</AssemblyVersion>
-    <FileVersion>1.0.0.0</FileVersion>
+    <AssemblyName>STORM_CONNECT_1.1.0_Setup</AssemblyName>
+    <Version>1.1.0</Version>
+    <AssemblyVersion>1.1.0.0</AssemblyVersion>
+    <FileVersion>1.1.0.0</FileVersion>
     <AssemblyTitle>STORM CONNECT</AssemblyTitle>
     <Product>STORM CONNECT</Product>
     <Title>STORM CONNECT</Title>

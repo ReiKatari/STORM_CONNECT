@@ -33,8 +33,108 @@
     <Style TargetType="{x:Type CheckBox}">
         <Setter Property="Foreground" Value="{DynamicResource ThemeTextPrimary}"/>
         <Setter Property="FontFamily" Value="{DynamicResource ThemeFontFamily}"/>
+        <Setter Property="FontSize" Value="13"/>
         <Setter Property="VerticalContentAlignment" Value="Center"/>
         <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type CheckBox}">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Background="Transparent">
+                        <Border x:Name="BoxBorder" Width="18" Height="18" CornerRadius="5"
+                                Background="{DynamicResource ThemeInputBg}"
+                                BorderBrush="{DynamicResource ThemeCardBorder}"
+                                BorderThickness="1.5" VerticalAlignment="Center">
+                            <Border x:Name="InnerFill" CornerRadius="3.5" Margin="1.5"
+                                    Background="{DynamicResource ThemeAccentGradient}"
+                                    Opacity="0"/>
+                        </Border>
+                        <ContentPresenter Margin="9,0,0,0" VerticalAlignment="Center"
+                                          HorizontalAlignment="Left" RecognizesAccessKey="False"/>
+                    </StackPanel>
+                    <ControlTemplate.Triggers>
+                        <Trigger Property="IsMouseOver" Value="True">
+                            <Setter TargetName="BoxBorder" Property="BorderBrush" Value="{DynamicResource ThemeAccent}"/>
+                        </Trigger>
+                        <Trigger Property="IsChecked" Value="True">
+                            <Setter TargetName="BoxBorder" Property="BorderBrush" Value="{DynamicResource ThemeAccent}"/>
+                            <Setter TargetName="BoxBorder" Property="Background" Value="{DynamicResource ThemeAccentSoft}"/>
+                            <Setter TargetName="InnerFill" Property="Opacity" Value="1"/>
+                        </Trigger>
+                        <Trigger Property="IsEnabled" Value="False">
+                            <Setter Property="Opacity" Value="0.5"/>
+                        </Trigger>
+                    </ControlTemplate.Triggers>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+
+    <!-- Stylized Smooth STORM Slider -->
+    <Style TargetType="{x:Type Slider}">
+        <Setter Property="IsMoveToPointEnabled" Value="True"/>
+        <Setter Property="SnapsToDevicePixels" Value="True"/>
+        <Setter Property="Height" Value="24"/>
+        <Setter Property="Cursor" Value="Hand"/>
+        <Setter Property="Template">
+            <Setter.Value>
+                <ControlTemplate TargetType="{x:Type Slider}">
+                    <Grid VerticalAlignment="Center">
+                        <Border Height="6" CornerRadius="3" Background="{DynamicResource ThemeInputBg}"
+                                BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" VerticalAlignment="Center"/>
+                        <Track x:Name="PART_Track" VerticalAlignment="Center">
+                            <Track.DecreaseRepeatButton>
+                                <RepeatButton Command="Slider.DecreaseLarge" IsTabStop="False">
+                                    <RepeatButton.Template>
+                                        <ControlTemplate TargetType="{x:Type RepeatButton}">
+                                            <Border Height="6" CornerRadius="3" Background="{DynamicResource ThemeAccentGradient}"/>
+                                        </ControlTemplate>
+                                    </RepeatButton.Template>
+                                </RepeatButton>
+                            </Track.DecreaseRepeatButton>
+                            <Track.IncreaseRepeatButton>
+                                <RepeatButton Command="Slider.IncreaseLarge" IsTabStop="False">
+                                    <RepeatButton.Template>
+                                        <ControlTemplate TargetType="{x:Type RepeatButton}">
+                                            <Border Height="14" Background="Transparent"/>
+                                        </ControlTemplate>
+                                    </RepeatButton.Template>
+                                </RepeatButton>
+                            </Track.IncreaseRepeatButton>
+                            <Track.Thumb>
+                                <Thumb>
+                                    <Thumb.Template>
+                                        <ControlTemplate TargetType="{x:Type Thumb}">
+                                            <Grid Width="18" Height="18" RenderTransformOrigin="0.5,0.5">
+                                                <Grid.RenderTransform>
+                                                    <ScaleTransform x:Name="ThumbScale" ScaleX="1" ScaleY="1"/>
+                                                </Grid.RenderTransform>
+                                                <Ellipse Fill="{DynamicResource ThemeAccentGradient}" Stroke="#FFFFFF" StrokeThickness="2">
+                                                    <Ellipse.Effect>
+                                                        <DropShadowEffect ShadowDepth="1" BlurRadius="8" Opacity="0.55" Color="#8B5CF6"/>
+                                                    </Ellipse.Effect>
+                                                </Ellipse>
+                                            </Grid>
+                                            <ControlTemplate.Triggers>
+                                                <Trigger Property="IsMouseOver" Value="True">
+                                                    <Setter Property="RenderTransform">
+                                                        <Setter.Value><ScaleTransform ScaleX="1.15" ScaleY="1.15"/></Setter.Value>
+                                                    </Setter>
+                                                </Trigger>
+                                                <Trigger Property="IsDragging" Value="True">
+                                                    <Setter Property="RenderTransform">
+                                                        <Setter.Value><ScaleTransform ScaleX="0.95" ScaleY="0.95"/></Setter.Value>
+                                                    </Setter>
+                                                </Trigger>
+                                            </ControlTemplate.Triggers>
+                                        </ControlTemplate>
+                                    </Thumb.Template>
+                                </Thumb>
+                            </Track.Thumb>
+                        </Track>
+                    </Grid>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
     </Style>
 
     <!-- 3D Volumetric Primary Action Button -->
@@ -233,7 +333,7 @@
         </Setter>
     </Style>
 
-    <!-- 100% Theme-Styled ComboBox & Popup (Law 19) -->
+    <!-- 100% Theme-Styled ComboBox & Popup with working PART_Popup + ItemsPresenter (Law 19) -->
     <Style x:Key="StormComboBox" TargetType="{x:Type ComboBox}">
         <Setter Property="Foreground" Value="{DynamicResource ThemeTextPrimary}"/>
         <Setter Property="Background" Value="{DynamicResource ThemeCardBg}"/>
@@ -272,14 +372,17 @@
                         <ContentPresenter x:Name="ContentSite" IsHitTestVisible="False"
                                           Content="{TemplateBinding SelectionBoxItem}"
                                           ContentTemplate="{TemplateBinding SelectionBoxItemTemplate}"
+                                          ContentTemplateSelector="{TemplateBinding ItemTemplateSelector}"
+                                          ContentStringFormat="{TemplateBinding SelectionBoxItemStringFormat}"
+                                          TextElement.Foreground="{DynamicResource ThemeTextPrimary}"
                                           Margin="10,0,26,0" VerticalAlignment="Center" HorizontalAlignment="Left"/>
-                        <Popup x:Name="Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
-                               AllowsTransparency="True" Focusable="False" PopupAnimation="Slide">
+                        <Popup x:Name="PART_Popup" Placement="Bottom" IsOpen="{TemplateBinding IsDropDownOpen}"
+                               AllowsTransparency="True" Focusable="False" StaysOpen="False" PopupAnimation="Slide">
                             <Border x:Name="DropDownBorder" MinWidth="{TemplateBinding ActualWidth}" MaxHeight="340"
                                     Margin="0,4,0,0" CornerRadius="8" Background="{DynamicResource ThemeHeaderBg}"
                                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1">
-                                <ScrollViewer Margin="3" SnapsToDevicePixels="True">
-                                    <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
+                                <ScrollViewer Margin="3" SnapsToDevicePixels="True" CanContentScroll="True">
+                                    <ItemsPresenter SnapsToDevicePixels="True" KeyboardNavigation.DirectionalNavigation="Contained"/>
                                 </ScrollViewer>
                             </Border>
                         </Popup>
@@ -298,9 +401,12 @@
                         <Setter.Value>
                             <ControlTemplate TargetType="{x:Type ComboBoxItem}">
                                 <Border x:Name="ItemBd" CornerRadius="6" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}">
-                                    <ContentPresenter VerticalAlignment="Center"/>
+                                    <ContentPresenter VerticalAlignment="Center" TextElement.Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ComboBoxItem}}"/>
                                 </Border>
                                 <ControlTemplate.Triggers>
+                                    <Trigger Property="IsHighlighted" Value="True">
+                                        <Setter TargetName="ItemBd" Property="Background" Value="{DynamicResource ThemeAccentSoft}"/>
+                                    </Trigger>
                                     <Trigger Property="IsMouseOver" Value="True">
                                         <Setter TargetName="ItemBd" Property="Background" Value="{DynamicResource ThemeAccentSoft}"/>
                                     </Trigger>
@@ -405,8 +511,22 @@
                     <Setter Property="FontWeight" Value="Bold"/>
                     <Setter Property="FontSize" Value="11"/>
                     <Setter Property="Padding" Value="10,8"/>
+                    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+                    <Setter Property="VerticalContentAlignment" Value="Center"/>
                     <Setter Property="BorderBrush" Value="{DynamicResource ThemeCardBorder}"/>
                     <Setter Property="BorderThickness" Value="0,0,1,1"/>
+                    <Setter Property="Template">
+                        <Setter.Value>
+                            <ControlTemplate TargetType="{x:Type DataGridColumnHeader}">
+                                <Border Background="{TemplateBinding Background}"
+                                        BorderBrush="{TemplateBinding BorderBrush}"
+                                        BorderThickness="{TemplateBinding BorderThickness}"
+                                        Padding="{TemplateBinding Padding}">
+                                    <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Border>
+                            </ControlTemplate>
+                        </Setter.Value>
+                    </Setter>
                 </Style>
             </Setter.Value>
         </Setter>

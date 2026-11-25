@@ -47,6 +47,7 @@ public sealed class AppSettings
     public string RelayUrl { get; set; } = ProtocolConstants.DefaultRelayUrl;
     public bool EnableRelay { get; set; } = true;
     public bool EnableLocalRelayHost { get; set; }
+    public int ConnectionMethodIndex { get; set; } = 0;
     public int JpegQuality { get; set; } = 75;
     public bool StartMinimizedToTray { get; set; }
 

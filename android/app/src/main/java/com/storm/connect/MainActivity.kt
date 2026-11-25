@@ -564,6 +564,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkAndroidUpdates() {
+        val installedVer = runCatching {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "1.1.0"
+        }.getOrDefault("1.1.0")
         CoroutineScope(Dispatchers.IO).launch {
             runCatching {
                 val url = URL("https://stormgamesworld.ru/api/programs/releases?repo=STORM_CONNECT&latest=1")
@@ -573,13 +576,13 @@ class MainActivity : AppCompatActivity() {
                 val body = conn.inputStream.bufferedReader().readText()
                 val json = JSONObject(body)
                 val rel = json.optJSONObject("release") ?: json
-                val latest = rel.optString("version", "1.0.0").removePrefix("v")
+                val latest = rel.optString("version", installedVer).removePrefix("v")
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Installed: 1.0.0 | Latest: $latest", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this@MainActivity, "Installed: $installedVer | Latest: $latest", Toast.LENGTH_LONG).show()
                 }
             }.onFailure {
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Installed: 1.0.0", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@MainActivity, "Installed: $installedVer", Toast.LENGTH_SHORT).show()
                 }
             }
         }

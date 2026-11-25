@@ -18,11 +18,20 @@ public sealed record StormThemePalette(
     string Warning,
     string Error,
     bool HasAuroraFx
-);
+)
+{
+    public override string ToString() => Name;
+}
 
-public sealed record StormAccentOption(string Name, string PrimaryHex, string SecondaryHex);
+public sealed record StormAccentOption(string Name, string PrimaryHex, string SecondaryHex)
+{
+    public override string ToString() => Name;
+}
 
-public sealed record StormFontOption(string DisplayName, string WpfFamily);
+public sealed record StormFontOption(string DisplayName, string WpfFamily)
+{
+    public override string ToString() => DisplayName;
+}
 
 public static class ThemeService
 {

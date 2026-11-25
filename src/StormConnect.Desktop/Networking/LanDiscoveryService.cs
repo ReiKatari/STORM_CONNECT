@@ -75,6 +75,48 @@ public sealed class LanDiscoveryService : IDisposable
         return "127.0.0.1";
     }
 
+    public static (string? LanIpv4, string? VpnIpv4, string? GlobalIpv6) GetAllReachableAddresses()
+    {
+        string? lan = null;
+        string? vpn = null;
+        string? v6 = null;
+        try
+        {
+            foreach (var ni in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (ni.OperationalStatus != OperationalStatus.Up || ni.NetworkInterfaceType == NetworkInterfaceType.Loopback)
+                    continue;
+                string desc = (ni.Name + " " + ni.Description).ToLowerInvariant();
+                bool looksLikeVpn = desc.Contains("tailscale") || desc.Contains("wireguard") || desc.Contains("radmin") ||
+                                    desc.Contains("zerotier") || desc.Contains("vpn") || desc.Contains("tun") || desc.Contains("tap");
+
+                foreach (var addr in ni.GetIPProperties().UnicastAddresses)
+                {
+                    if (IPAddress.IsLoopback(addr.Address)) continue;
+                    if (addr.Address.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        var ipStr = addr.Address.ToString();
+                        if (looksLikeVpn || ipStr.StartsWith("100.", StringComparison.Ordinal) || ipStr.StartsWith("26.", StringComparison.Ordinal))
+                            vpn ??= ipStr;
+                        else
+                            lan ??= ipStr;
+                    }
+                    else if (addr.Address.AddressFamily == AddressFamily.InterNetworkV6 &&
+                             !addr.Address.IsIPv6LinkLocal &&
+                             !addr.Address.IsIPv6SiteLocal &&
+                             !addr.Address.IsIPv6Multicast)
+                    {
+                        var s = addr.Address.ToString();
+                        if (!s.StartsWith("fe80", StringComparison.OrdinalIgnoreCase) && !s.StartsWith("fc", StringComparison.OrdinalIgnoreCase) && !s.StartsWith("fd", StringComparison.OrdinalIgnoreCase))
+                            v6 ??= s;
+                    }
+                }
+            }
+        }
+        catch { }
+        return (lan ?? GetPrimaryLocalIp(), vpn, v6);
+    }
+
     private async Task ListenLoopAsync(CancellationToken ct)
     {
         UdpClient? udp = null;

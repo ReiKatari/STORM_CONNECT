@@ -31,7 +31,10 @@ public sealed record MonitorInfo(
     int Width,
     int Height,
     bool IsPrimary
-);
+)
+{
+    public override string ToString() => Name;
+}
 
 public sealed class SessionPermissions
 {

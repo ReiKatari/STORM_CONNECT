@@ -80,6 +80,7 @@ public sealed class ClientSession : IAsyncDisposable
         string relayUrl,
         IReadOnlyList<DiscoveredDevice> lanDevices,
         Func<string, bool, Task<string?>> promptPasswordOrPin,
+        int preferredMethodIndex = 0, // 0=Auto, 1=DirectOnly, 2=InviteCode, 3=RelayOnly
         CancellationToken ct = default)
     {
         _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -89,39 +90,48 @@ public sealed class ClientSession : IAsyncDisposable
         string trimmed = targetInput.Trim();
         string normDigits = DeviceIdentity.NormalizeId(trimmed);
 
-        // 1. Check if target is an IP:Port or hostname
-        if (normDigits.Length != 9 || trimmed.Contains('.') || trimmed.Contains(':'))
+        // 0. Check if target is a serverless Direct Invite Code (SC1-...)
+        if (InviteCode.TryDecode(trimmed, out var invite) && invite is not null)
         {
-            StatusChanged?.Invoke("Connecting via Direct IP...");
+            StatusChanged?.Invoke(Services.LocalizationService.T("StatusConnectingInvite"));
+            rawChannel = await ConnectViaInviteCascadeAsync(invite, lanDevices, relayUrl, preferredMethodIndex == 2, token).ConfigureAwait(false);
+        }
+        // 1. Check if target is an explicit IPv4/IPv6/hostname
+        else if (normDigits.Length != 9 || trimmed.Contains('.') || trimmed.Contains(':'))
+        {
+            StatusChanged?.Invoke(Services.LocalizationService.T("StatusConnectingDirect"));
             rawChannel = await ConnectDirectTcpAsync(trimmed, ProtocolConstants.DefaultDirectPort, ConnectionMode.DirectIp, token).ConfigureAwait(false);
         }
         else
         {
-            // 2. Check if target is discovered on LAN for 0-hop gigabit speed
-            var lanPeer = lanDevices.FirstOrDefault(d => d.StormId == normDigits);
-            if (lanPeer is not null)
+            // 2. Try LAN Discovery peer first unless Relay-Only is forced
+            if (preferredMethodIndex != 3)
             {
-                try
+                var lanPeer = lanDevices.FirstOrDefault(d => d.StormId == normDigits);
+                if (lanPeer is not null)
                 {
-                    StatusChanged?.Invoke($"Connecting via LAN Direct ({lanPeer.LocalIp})...");
-                    rawChannel = await ConnectDirectTcpAsync(lanPeer.LocalIp, lanPeer.DirectPort, ConnectionMode.LanDirect, token).ConfigureAwait(false);
-                }
-                catch
-                {
-                    rawChannel = null;
+                    try
+                    {
+                        StatusChanged?.Invoke($"{Services.LocalizationService.T("StatusConnectingLan")} ({lanPeer.LocalIp})");
+                        rawChannel = await ConnectDirectTcpAsync(lanPeer.LocalIp, lanPeer.DirectPort, ConnectionMode.LanDirect, token).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        rawChannel = null;
+                    }
                 }
             }
 
-            // 3. Fallback to zero-knowledge WSS Relay
-            if (rawChannel is null)
+            // 3. Fallback to WSS Relay unless Direct-Only is forced
+            if (rawChannel is null && preferredMethodIndex != 1)
             {
-                StatusChanged?.Invoke("Connecting via STORM CONNECT Relay...");
+                StatusChanged?.Invoke(Services.LocalizationService.T("StatusConnectingRelay"));
                 rawChannel = await ConnectViaRelayAsync(normDigits, relayUrl, token).ConfigureAwait(false);
             }
         }
 
         if (rawChannel is null)
-            throw new IOException("Unable to establish connection to target peer.");
+            throw new IOException(Services.LocalizationService.T("StatusConnFailed"));
 
         // 4. ECDH P-256 + AES-256-GCM Handshake (Client is Initiator)
         using var crypto = new CryptoSession();
@@ -195,20 +205,77 @@ public sealed class ClientSession : IAsyncDisposable
         _ = Task.Run(() => PingLoopAsync(token), token);
     }
 
-    private static async Task<ITransportChannel> ConnectDirectTcpAsync(string hostSpec, int defaultPort, ConnectionMode mode, CancellationToken ct)
+    private async Task<ITransportChannel?> ConnectViaInviteCascadeAsync(
+        InviteCodePayload invite,
+        IReadOnlyList<DiscoveredDevice> lanDevices,
+        string relayUrl,
+        bool directOnly,
+        CancellationToken ct)
     {
-        string host = hostSpec;
-        int port = defaultPort;
-        int colon = hostSpec.LastIndexOf(':');
-        if (colon > 0 && int.TryParse(hostSpec[(colon + 1)..], out int parsedPort))
+        var candidates = new List<(string Host, int Port, ConnectionMode Mode)>();
+        var lanMatch = lanDevices.FirstOrDefault(d => d.StormId == DeviceIdentity.NormalizeId(invite.StormId));
+        if (lanMatch is not null)
+            candidates.Add((lanMatch.LocalIp, lanMatch.DirectPort, ConnectionMode.LanDirect));
+        if (!string.IsNullOrWhiteSpace(invite.LanIp))
+            candidates.Add((invite.LanIp, invite.DirectPort, ConnectionMode.LanDirect));
+        if (!string.IsNullOrWhiteSpace(invite.VpnIp))
+            candidates.Add((invite.VpnIp, invite.DirectPort, ConnectionMode.DirectIp));
+        if (!string.IsNullOrWhiteSpace(invite.GlobalIpv6))
+            candidates.Add(($"[{invite.GlobalIpv6}]", invite.DirectPort, ConnectionMode.DirectIp));
+        if (!string.IsNullOrWhiteSpace(invite.PublicIpv4) && invite.MappedTcpPort > 0)
+            candidates.Add((invite.PublicIpv4, invite.MappedTcpPort, ConnectionMode.DirectIp));
+
+        foreach (var (host, port, mode) in candidates.DistinctBy(c => $"{c.Host}:{c.Port}"))
         {
-            host = hostSpec[..colon];
-            port = parsedPort;
+            try
+            {
+                return await ConnectDirectTcpAsync(host, port, mode, ct).ConfigureAwait(false);
+            }
+            catch { }
         }
 
-        var tcp = new TcpClient();
+        if (!directOnly && !string.IsNullOrWhiteSpace(relayUrl))
+        {
+            try
+            {
+                return await ConnectViaRelayAsync(DeviceIdentity.NormalizeId(invite.StormId), relayUrl, ct).ConfigureAwait(false);
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    private static async Task<ITransportChannel> ConnectDirectTcpAsync(string hostSpec, int defaultPort, ConnectionMode mode, CancellationToken ct)
+    {
+        string host = hostSpec.Trim();
+        int port = defaultPort;
+
+        if (host.StartsWith('['))
+        {
+            int endBracket = host.IndexOf(']');
+            if (endBracket > 0)
+            {
+                string v6 = host[1..endBracket];
+                if (endBracket + 2 <= host.Length && host[endBracket + 1] == ':' && int.TryParse(host[(endBracket + 2)..], out int p6))
+                    port = p6;
+                host = v6;
+            }
+        }
+        else
+        {
+            int firstColon = host.IndexOf(':');
+            int lastColon = host.LastIndexOf(':');
+            if (firstColon == lastColon && lastColon > 0 && int.TryParse(host[(lastColon + 1)..], out int parsedPort))
+            {
+                host = host[..lastColon];
+                port = parsedPort;
+            }
+        }
+
+        var tcp = new TcpClient(AddressFamily.InterNetworkV6);
+        tcp.Client.DualMode = true;
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(TimeSpan.FromSeconds(5));
+        timeoutCts.CancelAfter(TimeSpan.FromSeconds(4));
         await tcp.ConnectAsync(host, port, timeoutCts.Token).ConfigureAwait(false);
         return new TcpTransportChannel(tcp, mode);
     }

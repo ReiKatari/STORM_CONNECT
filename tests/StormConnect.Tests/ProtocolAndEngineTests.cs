@@ -155,4 +155,72 @@ public sealed class ProtocolAndEngineTests
         Assert.Equal(0xAA, pkt[6]);
         Assert.Equal(0xFF, pkt[11]);
     }
+
+    [Fact]
+    public void InviteCode_EncodeDecode_RoundTrip()
+    {
+        var src = new InviteCodePayload(
+            "123456789",
+            "WORKSTATION",
+            7440,
+            "192.168.1.50",
+            "100.64.0.12",
+            "203.0.113.45",
+            7440,
+            "203.0.113.45:51234",
+            "2001:db8::1");
+
+        var code = InviteCode.Encode(src);
+        Assert.StartsWith("SC1-", code);
+        Assert.True(InviteCode.TryDecode(code, out var decoded));
+        Assert.NotNull(decoded);
+        Assert.Equal(src.StormId, decoded!.StormId);
+        Assert.Equal(src.LanIp, decoded.LanIp);
+        Assert.Equal(src.VpnIp, decoded.VpnIp);
+        Assert.Equal(src.PublicIpv4, decoded.PublicIpv4);
+        Assert.Equal(src.GlobalIpv6, decoded.GlobalIpv6);
+    }
+
+    [Fact]
+    public void StunClient_ParsesRfc5389XorMappedAddress()
+    {
+        var txId = new byte[12] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+        var req = StunClient.BuildBindingRequest(txId);
+        Assert.Equal(20, req.Length);
+
+        // Construct valid Binding Success Response with XOR-MAPPED-ADDRESS for 198.51.100.77:54321
+        var resp = new byte[32];
+        resp[0] = 0x01; resp[1] = 0x01; // Binding Success
+        resp[2] = 0x00; resp[3] = 0x0C; // 12 bytes attr
+        resp[4] = 0x21; resp[5] = 0x12; resp[6] = 0xA4; resp[7] = 0x42; // Cookie
+        Buffer.BlockCopy(txId, 0, resp, 8, 12);
+
+        resp[20] = 0x00; resp[21] = 0x20; // XOR-MAPPED-ADDRESS
+        resp[22] = 0x00; resp[23] = 0x08; // Len 8
+        resp[24] = 0x00; resp[25] = 0x01; // Family IPv4
+        ushort xPort = (ushort)(54321 ^ 0x2112);
+        resp[26] = (byte)(xPort >> 8); resp[27] = (byte)(xPort & 0xFF);
+        resp[28] = (byte)(198 ^ 0x21);
+        resp[29] = (byte)(51 ^ 0x12);
+        resp[30] = (byte)(100 ^ 0xA4);
+        resp[31] = (byte)(77 ^ 0x42);
+
+        var ep = StunClient.ParseBindingResponse(resp, txId);
+        Assert.NotNull(ep);
+        Assert.Equal("198.51.100.77", ep!.Address.ToString());
+        Assert.Equal(54321, ep.Port);
+    }
+
+    [Fact]
+    public void SelectorOptions_ToString_NeverReturnsRecordTypeName()
+    {
+        foreach (var l in LocalizationService.Languages)
+            Assert.Equal(l.DisplayName, l.ToString());
+        foreach (var t in ThemeService.Themes)
+            Assert.Equal(t.Name, t.ToString());
+        foreach (var a in ThemeService.Accents)
+            Assert.Equal(a.Name, a.ToString());
+        foreach (var f in ThemeService.Fonts)
+            Assert.Equal(f.DisplayName, f.ToString());
+    }
 }

@@ -116,9 +116,10 @@ public sealed class HostServer : IAsyncDisposable
     {
         try
         {
-            _listener = new TcpListener(IPAddress.Any, _listenPort);
+            // Dual-stack IPv6 + IPv4 listener so global IPv6, LAN, VPN, and UPnP IPv4 work seamlessly with zero server
+            _listener = TcpListener.Create(_listenPort);
             _listener.Start();
-            AuditLogEvent?.Invoke($"Direct TCP host listening on port {_listenPort}");
+            AuditLogEvent?.Invoke($"Direct Dual-Stack TCP host listening on port {_listenPort}");
 
             while (!ct.IsCancellationRequested)
             {
@@ -256,7 +257,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.0.0", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.1.0", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);

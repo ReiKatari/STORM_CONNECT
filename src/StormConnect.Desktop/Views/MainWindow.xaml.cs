@@ -8,20 +8,19 @@ using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
-using System.Windows.Threading;
-using MouseEventArgs = System.Windows.Input.MouseEventArgs;
-using Brushes = System.Windows.Media.Brushes;
-using Brush = System.Windows.Media.Brush;
-using Button = System.Windows.Controls.Button;
 using StormConnect.Desktop.Engine;
 using StormConnect.Desktop.Networking;
 using StormConnect.Desktop.Services;
 using StormConnect.Protocol;
+using MouseEventArgs = System.Windows.Input.MouseEventArgs;
+using Brushes = System.Windows.Media.Brushes;
+using Brush = System.Windows.Media.Brush;
+using Button = System.Windows.Controls.Button;
 
 namespace StormConnect.Desktop.Views;
 
 public sealed record FileGridRow(string Name, string FullPath, bool IsDirectory, long SizeBytes, string SizeDisplay, string ModifiedDisplay);
-public sealed record AddressGridRow(AddressBookEntry Entry, string Alias, string FormattedId, string HostOrIp, string Group, string MacAddress);
+public sealed record AddressGridRow(AddressBookEntry Entry, string Alias, string FormattedId, string HostOrIp, string Group, string MacAddress, string ConnectLabel, string WolLabel);
 
 public partial class MainWindow : Window
 {
@@ -43,6 +42,12 @@ public partial class MainWindow : Window
     private UpdateCheckResult? _pendingUpdate;
     private CancellationTokenSource? _updateDlCts;
 
+    private string? _lanIp;
+    private string? _vpnIp;
+    private string? _globalIpv6;
+    private UpnpMappingResult? _upnpResult;
+    private string? _stunUdpEndpoint;
+
     private TaskCompletionSource<ConsentDecisionPayload>? _consentTcs;
     private TaskCompletionSource<string?>? _authTcs;
 
@@ -50,10 +55,9 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
 
-        // Clamp default window size to screen WorkArea (Law 17)
         var wa = SystemParameters.WorkArea;
-        Width = Math.Min(1440, wa.Width - 32);
-        Height = Math.Min(860, wa.Height - 32);
+        Width = Math.Min(1480, wa.Width - 24);
+        Height = Math.Min(860, wa.Height - 24);
 
         RegeneratePin();
         InitializeSelectors();
@@ -67,7 +71,7 @@ public partial class MainWindow : Window
 
         _initializingUi = false;
 
-        // Silent background Auto-Update check (Law 9)
+        _ = RefreshServerlessConnectivityAsync();
         _ = CheckUpdatesSilentlyAsync();
     }
 
@@ -77,8 +81,7 @@ public partial class MainWindow : Window
         var hwnd = new WindowInteropHelper(this).Handle;
         EnableDarkDwmTitleBar(hwnd);
 
-        // UAC UIPI Drag-and-Drop bypass (Law 22)
-        ChangeWindowMessageFilterEx(hwnd, 0x0233 /* WM_DROPFILES */, 1 /* MSGFLT_ALLOW */, IntPtr.Zero);
+        ChangeWindowMessageFilterEx(hwnd, 0x0233 /* WM_DROPFILES */, 1, IntPtr.Zero);
         ChangeWindowMessageFilterEx(hwnd, 0x0049 /* WM_COPYGLOBALDATA */, 1, IntPtr.Zero);
         ChangeWindowMessageFilterEx(hwnd, 0x004A /* WM_COPYDATA */, 1, IntPtr.Zero);
         DragAcceptFiles(hwnd, true);
@@ -108,24 +111,17 @@ public partial class MainWindow : Window
     private void InitializeSelectors()
     {
         CmbLang.ItemsSource = LocalizationService.Languages;
-        CmbLang.DisplayMemberPath = "DisplayName";
         CmbLang.SelectedItem = LocalizationService.Languages.FirstOrDefault(l => l.Code == LocalizationService.CurrentLanguage)
                                ?? LocalizationService.Languages[0];
 
         CmbTheme.ItemsSource = ThemeService.Themes;
-        CmbTheme.DisplayMemberPath = "Name";
         CmbTheme.SelectedItem = ThemeService.CurrentTheme;
 
         CmbAccent.ItemsSource = ThemeService.Accents;
-        CmbAccent.DisplayMemberPath = "Name";
         CmbAccent.SelectedItem = ThemeService.CurrentAccent;
 
         CmbFont.ItemsSource = ThemeService.Fonts;
-        CmbFont.DisplayMemberPath = "DisplayName";
         CmbFont.SelectedItem = ThemeService.CurrentFont;
-
-        CmbQuality.ItemsSource = new[] { "90% HD", "75% Balanced", "55% Fast", "35% Low-BW" };
-        CmbQuality.SelectedIndex = 1;
     }
 
     private void InitializeTrayAndServices()
@@ -172,7 +168,7 @@ public partial class MainWindow : Window
             TxtActiveGuestsBadge.Text = $"{LocalizationService.T("ActiveIncoming")}: {_hostServer.ActiveClientCount}";
             App.Settings.AddAudit($"{ctx.ClientName} ({ctx.ClientStormId})", ctx.Mode.ToString(), "Incoming Connected");
             RefreshAuditGrid();
-            _tray?.ShowBalloon("STORM CONNECT", $"{ctx.ClientName} connected ({ctx.Mode})");
+            _tray?.ShowBalloon("STORM CONNECT", $"{ctx.ClientName} ({ctx.Mode})");
         });
         _hostServer.ClientDisconnected += _ => Dispatcher.Invoke(() =>
         {
@@ -192,6 +188,52 @@ public partial class MainWindow : Window
             DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
     }
 
+    private async Task RefreshServerlessConnectivityAsync()
+    {
+        try
+        {
+            (_lanIp, _vpnIp, _globalIpv6) = LanDiscoveryService.GetAllReachableAddresses();
+            int port = App.Settings.Current.DirectPort;
+
+            var upnpTask = UpnpPortMapper.TryMapPortAsync(port, _lanIp ?? "127.0.0.1", "TCP");
+            var stunTask = StunClient.DiscoverPublicEndpointAsync();
+            await Task.WhenAll(upnpTask, stunTask).ConfigureAwait(false);
+
+            _upnpResult = await upnpTask;
+            var stunEp = await stunTask;
+            _stunUdpEndpoint = stunEp?.ToString();
+
+            Dispatcher.Invoke(UpdateServerlessSummaryUi);
+        }
+        catch { }
+    }
+
+    private void UpdateServerlessSummaryUi()
+    {
+        int port = App.Settings.Current.DirectPort;
+        string upnpText = _upnpResult?.Success == true
+            ? $"{_upnpResult.Method}: {_upnpResult.ExternalIp}:{_upnpResult.MappedExternalPort}"
+            : "UPnP / NAT-PMP: N/A";
+        TxtDirectAddresses.Text =
+            $"LAN: {_lanIp ?? "-"}:{port}  |  VPN: {_vpnIp ?? "-"}\n" +
+            $"IPv6: {_globalIpv6 ?? "-"}  |  {upnpText}  |  STUN: {_stunUdpEndpoint ?? "-"}";
+    }
+
+    private string BuildCurrentInviteCode()
+    {
+        var s = App.Settings.Current;
+        return InviteCode.Encode(new InviteCodePayload(
+            s.StormId,
+            Environment.MachineName,
+            s.DirectPort,
+            _lanIp ?? LanDiscoveryService.GetPrimaryLocalIp(),
+            _vpnIp,
+            _upnpResult?.ExternalIp ?? (_stunUdpEndpoint?.Split(':')[0]),
+            _upnpResult?.Success == true ? _upnpResult.MappedExternalPort : s.DirectPort,
+            _stunUdpEndpoint,
+            _globalIpv6));
+    }
+
     private void LoadSettingsToUi()
     {
         var s = App.Settings.Current;
@@ -204,6 +246,7 @@ public partial class MainWindow : Window
         ChkPermFiles.IsChecked = s.DefaultAllowFileTransfer;
         ChkPermAudio.IsChecked = s.DefaultAllowAudio;
         ChkPermSystem.IsChecked = s.DefaultAllowSystemActions;
+        CmbConnMethod.SelectedIndex = Math.Clamp(s.ConnectionMethodIndex, 0, 3);
         SliderUiScale.Value = Math.Clamp(s.UiScale, 0.80, 1.35);
         UiScaleTransform.ScaleX = SliderUiScale.Value;
         UiScaleTransform.ScaleY = SliderUiScale.Value;
@@ -213,6 +256,9 @@ public partial class MainWindow : Window
     private void ApplyLocalization()
     {
         string T(string k) => LocalizationService.T(k);
+        bool prevInit = _initializingUi;
+        _initializingUi = true;
+
         TxtSubtitle.Text = T("AppSubtitle");
         TxtBtnUpdates.Text = T("CheckUpdates");
         TxtBtnAbout.Text = T("About");
@@ -232,24 +278,54 @@ public partial class MainWindow : Window
 
         TxtLabelMyId.Text = T("MyStormId");
         TxtBtnCopyId.Text = T("CopyId");
+        TxtBtnCopyInvite.Text = T("CopyInvite");
+        TxtBtnNetCopyInvite.Text = T("CopyInvite");
         TxtLabelPin.Text = T("OneTimePin");
         TxtBtnRefreshPin.Text = T("RefreshPin");
         ChkAllowIncoming.Content = T("IncomingStatus");
         TxtLabelQuickConnect.Text = T("QuickConnectTitle");
+        TxtTargetInput.ToolTip = T("TargetPlaceholder");
         TxtBtnConnect.Text = T("ConnectBtn");
+        TxtLabelConnMethod.Text = T("ConnMethodLabel") + ":";
+
+        int methodIdx = CmbConnMethod.SelectedIndex >= 0 ? CmbConnMethod.SelectedIndex : App.Settings.Current.ConnectionMethodIndex;
+        CmbConnMethod.ItemsSource = new[] { T("MethodAuto"), T("MethodDirect"), T("MethodInvite"), T("MethodRelay") };
+        CmbConnMethod.SelectedIndex = Math.Clamp(methodIdx, 0, 3);
+
+        if (_clientSession?.IsConnected != true)
+        {
+            TxtConnectStatus.Text = T("StatusReady");
+            TxtViewerHud.Text = T("ViewerIdle");
+            CmbMonitorSelect.ItemsSource = new[] { T("MonitorNone") };
+            CmbMonitorSelect.SelectedIndex = 0;
+        }
+
+        int qIdx = CmbQuality.SelectedIndex >= 0 ? CmbQuality.SelectedIndex : 1;
+        CmbQuality.ItemsSource = new[] { T("Qual90"), T("Qual75"), T("Qual55"), T("Qual35") };
+        CmbQuality.SelectedIndex = Math.Clamp(qIdx, 0, 3);
+
         TxtLabelLanDevices.Text = T("LanDevicesTitle");
         TxtNoLanDevices.Text = T("NoLanDevices");
         TxtLabelTelemetry.Text = T("LiveTelemetry");
+
+        if (_clientSession?.IsConnected != true)
+        {
+            BadgeFps.Text = $"{T("LabelFps")}: 0";
+            BadgeRtt.Text = $"{T("LabelRtt")}: 0 {T("UnitMs")}";
+            BadgeMbps.Text = $"0.00 {T("UnitMbps")}";
+            BadgeSavings.Text = $"{T("LabelDelta")}: 0%";
+        }
 
         TxtBtnTaskMgr.Text = T("CtrlAltDel");
         TxtBtnLockRemote.Text = T("LockRemote");
         TxtBtnScreenshot.Text = T("Screenshot");
         TxtBtnChat.Text = T("Chat");
+        TxtChatTitle.Text = T("Chat").ToUpperInvariant();
         TxtBtnFullscreen.Text = T("Fullscreen");
         TxtBtnDisconnect.Text = T("DisconnectBtn");
         TxtNoActiveSession.Text = T("NoActiveSession");
         TxtDropFilesHint.Text = T("DropFilesHint");
-        TxtBtnAudio.Text = $"{T("AudioToggle")}: {(_audioEnabled ? "ON" : "OFF")}";
+        TxtBtnAudio.Text = $"{T("AudioToggle")}: {(_audioEnabled ? T("StateOn") : T("StateOff"))}";
 
         TxtLabelLocalFiles.Text = T("LocalFiles");
         TxtLabelRemoteFiles.Text = T("RemoteFiles");
@@ -258,6 +334,7 @@ public partial class MainWindow : Window
         TxtRemoteRefresh.Text = T("Refresh");
         TxtUploadBtn.Text = T("Upload");
         TxtDownloadBtn.Text = T("Download");
+        TxtFileTransferStatus.Text = T("FileReady");
         ColLocalName.Header = T("ColName");
         ColLocalSize.Header = T("ColSize");
         ColLocalMod.Header = T("ColModified");
@@ -266,6 +343,15 @@ public partial class MainWindow : Window
         ColRemoteMod.Header = T("ColModified");
 
         TxtBtnAddDevice.Text = T("AddDevice");
+        TxtAddDevTitle.Text = T("AddDevice");
+        TxtAddAlias.ToolTip = T("HintAlias");
+        TxtAddStormId.ToolTip = T("HintStormId");
+        TxtAddHost.ToolTip = T("HintHost");
+        TxtAddMac.ToolTip = T("HintMac");
+        TxtAddGroup.ToolTip = T("HintGroup");
+        TxtAddDevCancel.Text = T("Cancel");
+        TxtAddDevSave.Text = T("Ok");
+
         ColBookAlias.Header = T("ColAlias");
         ColBookStormId.Header = T("ColStormId");
         ColBookHost.Header = T("ColHost");
@@ -273,12 +359,18 @@ public partial class MainWindow : Window
         ColBookMac.Header = T("ColMac");
         ColBookActions.Header = T("ColActions");
 
+        TxtLabelServerlessTitle.Text = T("ServerlessCardTitle");
+        TxtBtnRefreshNetMap.Text = T("RefreshNetMap");
         TxtLabelRelayUrl.Text = T("RelayServerUrl");
         TxtLabelDirectPort.Text = T("DirectTcpPort");
         ChkEnableRelay.Content = T("EnableRelay");
+        TxtBtnSaveNetwork.Text = T("SaveNetworkBtn");
         TxtLabelEmbeddedRelay.Text = T("EmbeddedRelay");
         TxtDeployNote.Text = T("DeployNote");
         TxtBtnEmbeddedRelay.Text = _embeddedRelay.IsRunning ? T("StopHub") : T("StartHub");
+        TxtEmbeddedRelayStats.Text = _embeddedRelay.IsRunning
+            ? $"{T("HubListening")} ws://0.0.0.0:{_embeddedRelay.Port}/connect-relay"
+            : T("HubStopped");
 
         TxtLabelUnattended.Text = T("UnattendedPwd");
         TxtBtnSavePwd.Text = T("SavePassword");
@@ -296,6 +388,10 @@ public partial class MainWindow : Window
         ColAuditAction.Header = T("ColEvent");
 
         TxtConsentTitle.Text = T("ConsentTitle");
+        ChkConsentControl.Content = T("ConsentPermControl");
+        ChkConsentClipboard.Content = T("ConsentPermClipboard");
+        ChkConsentFiles.Content = T("ConsentPermFiles");
+        ChkConsentAudio.Content = T("ConsentPermAudio");
         TxtConsentAccept.Text = T("AcceptFull");
         TxtConsentViewOnly.Text = T("AcceptView");
         TxtConsentDecline.Text = T("Decline");
@@ -311,6 +407,10 @@ public partial class MainWindow : Window
 
         UpdateRelayBadge(_hostServer?.IsRelayConnected == true);
         TxtActiveGuestsBadge.Text = $"{T("ActiveIncoming")}: {_hostServer?.ActiveClientCount ?? 0}";
+        RefreshAddressBookGrid();
+        RefreshLanDevices(_lanDiscovery.CurrentDevices);
+
+        _initializingUi = prevInit;
     }
 
     private void ApplyThemeVisuals()
@@ -360,7 +460,7 @@ public partial class MainWindow : Window
             });
             stack.Children.Add(new TextBlock
             {
-                Text = $"{d.OsName} | {d.MonitorCount} Display(s)",
+                Text = $"{d.OsName} | {d.MonitorCount}",
                 FontSize = 11.5,
                 Foreground = (Brush)FindResource("ThemeTextSecondary"),
                 Margin = new Thickness(0, 0, 0, 8)
@@ -397,16 +497,15 @@ public partial class MainWindow : Window
         _clientSession.MonitorsUpdated += mons => Dispatcher.Invoke(() =>
         {
             CmbMonitorSelect.ItemsSource = mons;
-            CmbMonitorSelect.DisplayMemberPath = "Name";
             if (mons.Count > 0) CmbMonitorSelect.SelectedIndex = 0;
         });
         _clientSession.TelemetryUpdated += tel => Dispatcher.Invoke(() =>
         {
-            BadgeFps.Text = $"FPS: {tel.Fps:0.#}";
-            BadgeRtt.Text = $"RTT: {tel.RttMs} ms";
-            BadgeMbps.Text = $"{tel.BandwidthMbps:0.##} Mbps";
-            BadgeSavings.Text = $"Delta: {tel.TileSavingsPercent:0.#}%";
-            TxtViewerHud.Text = $"{tel.Mode} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} FPS | {tel.RttMs} ms";
+            BadgeFps.Text = $"{LocalizationService.T("LabelFps")}: {tel.Fps:0.#}";
+            BadgeRtt.Text = $"{LocalizationService.T("LabelRtt")}: {tel.RttMs} {LocalizationService.T("UnitMs")}";
+            BadgeMbps.Text = $"{tel.BandwidthMbps:0.##} {LocalizationService.T("UnitMbps")}";
+            BadgeSavings.Text = $"{LocalizationService.T("LabelDelta")}: {tel.TileSavingsPercent:0.#}%";
+            TxtViewerHud.Text = $"{tel.Mode} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} FPS | {tel.RttMs} {LocalizationService.T("UnitMs")}";
             TelemetryChart.PushSample(tel.Fps, tel.BandwidthMbps);
         });
         _clientSession.FileListReceived += fl => Dispatcher.Invoke(() => PopulateRemoteFiles(fl));
@@ -415,16 +514,18 @@ public partial class MainWindow : Window
             double pct = prog.TotalBytes > 0 ? prog.BytesDone * 100.0 / prog.TotalBytes : 100.0;
             PbFileTransfer.Value = Math.Clamp(pct, 0, 100);
             TxtFileTransferStatus.Text = prog.Error is not null
-                ? $"Error: {prog.Error}"
-                : $"{(prog.IsUpload ? "Upload" : "Download")} {prog.FileName}: {pct:0.#}% ({prog.SpeedMbps:0.##} Mbps)";
+                ? $"{LocalizationService.T("FileError")}: {prog.Error}"
+                : $"{(prog.IsUpload ? LocalizationService.T("FileUploading") : LocalizationService.T("FileDownloading"))} {prog.FileName}: {pct:0.#}% ({prog.SpeedMbps:0.##} {LocalizationService.T("UnitMbps")})";
             if (prog.Completed && prog.IsUpload)
                 _ = _clientSession.RequestFileListAsync(_currentRemoteDir);
         });
         _clientSession.ChatReceived += msg => Dispatcher.Invoke(() => AppendChatMessage(msg));
         _clientSession.Disconnected += reason => Dispatcher.Invoke(() =>
         {
-            TxtConnectStatus.Text = $"Disconnected: {reason}";
-            TxtViewerHud.Text = "Disconnected";
+            TxtConnectStatus.Text = $"{LocalizationService.T("StatusDisconnected")}: {reason}";
+            TxtViewerHud.Text = LocalizationService.T("ViewerIdle");
+            CmbMonitorSelect.ItemsSource = new[] { LocalizationService.T("MonitorNone") };
+            CmbMonitorSelect.SelectedIndex = 0;
             ViewerEmptyState.Visibility = Visibility.Visible;
         });
 
@@ -435,7 +536,8 @@ public partial class MainWindow : Window
                 target,
                 s.RelayUrl,
                 _lanDiscovery.CurrentDevices,
-                PromptOutgoingAuthAsync);
+                PromptOutgoingAuthAsync,
+                s.ConnectionMethodIndex);
 
             App.Settings.AddAudit(target, _clientSession.Telemetry.Mode.ToString(), "Outgoing Connected");
             RefreshAuditGrid();
@@ -445,7 +547,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            TxtConnectStatus.Text = $"Connection failed: {ex.Message}";
+            TxtConnectStatus.Text = $"{LocalizationService.T("StatusConnFailed")}: {ex.Message}";
         }
         finally
         {
@@ -501,7 +603,7 @@ public partial class MainWindow : Window
 
     private void Window_SizeChanged(object sender, SizeChangedEventArgs e)
     {
-        if (e.NewSize.Width < 1310)
+        if (e.NewSize.Width < 1380)
         {
             Grid.SetRow(HeaderControlsPanel, 1);
             Grid.SetColumn(HeaderControlsPanel, 0);
@@ -521,7 +623,6 @@ public partial class MainWindow : Window
 
     private void Window_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
-        // Mandatory ESC Modal Dismissal (Law 16)
         if (e.Key == Key.Escape)
         {
             if (ModalAbout.Visibility == Visibility.Visible) { ModalAbout.Visibility = Visibility.Collapsed; e.Handled = true; return; }
@@ -614,6 +715,13 @@ public partial class MainWindow : Window
         ThemeService.Apply(ThemeService.CurrentTheme.Name, ThemeService.CurrentAccent.Name, f.DisplayName);
         ApplyThemeVisuals();
     }
+
+    private void CmbConnMethod_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_initializingUi || CmbConnMethod.SelectedIndex < 0) return;
+        App.Settings.Current.ConnectionMethodIndex = CmbConnMethod.SelectedIndex;
+        App.Settings.Save();
+    }
     #endregion
 
     #region Dashboard, Consent & Auth Handlers
@@ -622,6 +730,18 @@ public partial class MainWindow : Window
         try { System.Windows.Clipboard.SetText(App.Settings.Current.StormId); } catch { }
         TxtBtnCopyId.Text = LocalizationService.T("Copied");
         _ = Task.Delay(1500).ContinueWith(_ => Dispatcher.Invoke(() => TxtBtnCopyId.Text = LocalizationService.T("CopyId")));
+    }
+
+    private void BtnCopyInvite_Click(object sender, RoutedEventArgs e)
+    {
+        try { System.Windows.Clipboard.SetText(BuildCurrentInviteCode()); } catch { }
+        TxtBtnCopyInvite.Text = LocalizationService.T("Copied");
+        TxtBtnNetCopyInvite.Text = LocalizationService.T("Copied");
+        _ = Task.Delay(1500).ContinueWith(_ => Dispatcher.Invoke(() =>
+        {
+            TxtBtnCopyInvite.Text = LocalizationService.T("CopyInvite");
+            TxtBtnNetCopyInvite.Text = LocalizationService.T("CopyInvite");
+        }));
     }
 
     private void BtnRefreshPin_Click(object sender, RoutedEventArgs e) => RegeneratePin();
@@ -698,6 +818,7 @@ public partial class MainWindow : Window
 
     private void CmbQuality_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
+        if (_initializingUi) return;
         _currentQuality = CmbQuality.SelectedIndex switch { 0 => 90, 1 => 75, 2 => 55, 3 => 35, _ => 75 };
         if (_clientSession is not null && CmbMonitorSelect.SelectedItem is MonitorInfo m)
             _ = _clientSession.SelectMonitorAsync(m.Index, _currentQuality);
@@ -707,7 +828,7 @@ public partial class MainWindow : Window
     {
         _audioEnabled = !_audioEnabled;
         _clientSession?.SetAudioEnabled(_audioEnabled);
-        TxtBtnAudio.Text = $"{LocalizationService.T("AudioToggle")}: {(_audioEnabled ? "ON" : "OFF")}";
+        TxtBtnAudio.Text = $"{LocalizationService.T("AudioToggle")}: {(_audioEnabled ? LocalizationService.T("StateOn") : LocalizationService.T("StateOff"))}";
     }
 
     private void BtnTaskMgr_Click(object sender, RoutedEventArgs e) => _ = _clientSession?.SendSystemActionAsync(SystemActionKind.OpenTaskManager);
@@ -725,7 +846,7 @@ public partial class MainWindow : Window
         var enc = new PngBitmapEncoder();
         enc.Frames.Add(BitmapFrame.Create(bmp));
         enc.Save(fs);
-        TxtViewerHud.Text = $"Saved screenshot: {Path.GetFileName(path)}";
+        TxtViewerHud.Text = $"{LocalizationService.T("StatusSavedShot")}: {Path.GetFileName(path)}";
     }
 
     private void BtnToggleChat_Click(object sender, RoutedEventArgs e)
@@ -787,7 +908,7 @@ public partial class MainWindow : Window
 
     private (double Nx, double Ny)? GetNormalizedRemoteCoords(MouseEventArgs e)
     {
-        if (ImgRemoteScreen.Source is not BitmapSource bmp) return null;
+        if (ImgRemoteScreen.Source is not BitmapSource) return null;
         double cw = ImgRemoteScreen.ActualWidth;
         double ch = ImgRemoteScreen.ActualHeight;
         if (cw <= 0 || ch <= 0) return null;
@@ -869,10 +990,7 @@ public partial class MainWindow : Window
         e.Handled = true;
     }
 
-    private void RemoteScreen_TextInput(object sender, TextCompositionEventArgs e)
-    {
-        // Virtual keys already handled in KeyDown/KeyUp
-    }
+    private void RemoteScreen_TextInput(object sender, TextCompositionEventArgs e) { }
     #endregion
 
     #region File Manager & Drag-and-Drop
@@ -968,7 +1086,7 @@ public partial class MainWindow : Window
     {
         if (_clientSession is null || !_clientSession.IsConnected)
         {
-            TxtConnectStatus.Text = "Connect to a remote device first to transfer dropped files.";
+            TxtConnectStatus.Text = LocalizationService.T("StatusConnectFirst");
             return;
         }
         string dest = string.IsNullOrWhiteSpace(_currentRemoteDir) ? @"C:\Users\Public\Downloads" : _currentRemoteDir;
@@ -992,12 +1110,14 @@ public partial class MainWindow : Window
     private void RefreshAddressBookGrid()
     {
         string q = TxtBookSearch.Text.Trim();
+        string connLbl = LocalizationService.T("ConnectBtn");
+        string wolLbl = LocalizationService.T("WakeOnLan");
         var items = App.Settings.Current.AddressBook
             .Where(x => string.IsNullOrEmpty(q) ||
                         x.Alias.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                         x.StormId.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                         x.HostOrIp.Contains(q, StringComparison.OrdinalIgnoreCase))
-            .Select(x => new AddressGridRow(x, x.Alias, DeviceIdentity.FormatId(x.StormId), x.HostOrIp, x.Group, x.MacAddress))
+            .Select(x => new AddressGridRow(x, x.Alias, DeviceIdentity.FormatId(x.StormId), x.HostOrIp, x.Group, x.MacAddress, connLbl, wolLbl))
             .ToList();
         GridAddressBook.ItemsSource = items;
     }
@@ -1038,9 +1158,9 @@ public partial class MainWindow : Window
             try
             {
                 await WakeOnLan.SendAsync(row.Entry.MacAddress);
-                TxtConnectStatus.Text = $"Wake-on-LAN magic packet sent to {row.Entry.MacAddress}";
+                TxtConnectStatus.Text = $"{LocalizationService.T("StatusWolSent")} {row.Entry.MacAddress}";
             }
-            catch (Exception ex) { TxtConnectStatus.Text = $"WOL error: {ex.Message}"; }
+            catch (Exception ex) { TxtConnectStatus.Text = $"WOL: {ex.Message}"; }
         }
     }
 
@@ -1053,6 +1173,8 @@ public partial class MainWindow : Window
             RefreshAddressBookGrid();
         }
     }
+
+    private void BtnRefreshNetMap_Click(object sender, RoutedEventArgs e) => _ = RefreshServerlessConnectivityAsync();
 
     private void BtnSaveNetwork_Click(object sender, RoutedEventArgs e)
     {
@@ -1071,13 +1193,13 @@ public partial class MainWindow : Window
         {
             await _embeddedRelay.StopAsync();
             TxtBtnEmbeddedRelay.Text = LocalizationService.T("StartHub");
-            TxtEmbeddedRelayStats.Text = "Stopped";
+            TxtEmbeddedRelayStats.Text = LocalizationService.T("HubStopped");
         }
         else
         {
             await _embeddedRelay.StartAsync();
             TxtBtnEmbeddedRelay.Text = LocalizationService.T("StopHub");
-            TxtEmbeddedRelayStats.Text = $"Listening on ws://0.0.0.0:{_embeddedRelay.Port}/connect-relay";
+            TxtEmbeddedRelayStats.Text = $"{LocalizationService.T("HubListening")} ws://0.0.0.0:{_embeddedRelay.Port}/connect-relay";
         }
     }
 
@@ -1085,13 +1207,13 @@ public partial class MainWindow : Window
     {
         App.Settings.SetUnattendedPassword(PwdUnattended.Password);
         PwdUnattended.Password = string.Empty;
-        TxtConnectStatus.Text = "Unattended password saved (DPAPI + PBKDF2).";
+        TxtConnectStatus.Text = LocalizationService.T("StatusPwdSaved");
     }
 
     private void BtnClearUnattended_Click(object sender, RoutedEventArgs e)
     {
         App.Settings.SetUnattendedPassword(null);
-        TxtConnectStatus.Text = "Unattended password cleared.";
+        TxtConnectStatus.Text = LocalizationService.T("StatusPwdCleared");
     }
 
     private void Perm_Changed(object sender, RoutedEventArgs e)
@@ -1144,7 +1266,7 @@ public partial class MainWindow : Window
         if (res.IsUpdateAvailable)
         {
             TxtUpdateSummary.Text = $"{res.CurrentVersion} -> {res.LatestVersion}";
-            TxtUpdateNotes.Text = string.IsNullOrWhiteSpace(res.ReleaseNotes) ? "New release available." : res.ReleaseNotes;
+            TxtUpdateNotes.Text = string.IsNullOrWhiteSpace(res.ReleaseNotes) ? LocalizationService.T("UpdateNewAvailable") : res.ReleaseNotes;
             BtnUpdateInstall.Visibility = string.IsNullOrWhiteSpace(res.InstallerDownloadUrl) ? Visibility.Collapsed : Visibility.Visible;
         }
         else
@@ -1174,7 +1296,7 @@ public partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            TxtUpdateSummary.Text = $"Download error: {ex.Message}";
+            TxtUpdateSummary.Text = $"{LocalizationService.T("FileError")}: {ex.Message}";
             BtnUpdateInstall.IsEnabled = true;
         }
     }

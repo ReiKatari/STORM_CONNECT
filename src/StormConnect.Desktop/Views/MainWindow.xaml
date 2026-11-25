@@ -2,8 +2,8 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:ctrl="clr-namespace:StormConnect.Desktop.Controls"
-        Title="STORM CONNECT 1.0.0"
-        Width="1440" Height="860"
+        Title="STORM CONNECT 1.1.0"
+        Width="1480" Height="860"
         MinWidth="1140" MinHeight="680"
         WindowStartupLocation="CenterScreen"
         WindowStyle="None"
@@ -30,7 +30,7 @@
 
         <!-- Procedural STORM Theme Aurora Background Layer -->
         <Canvas x:Name="AuroraBackdrop" IsHitTestVisible="False" Visibility="Collapsed">
-            <Ellipse x:Name="AuroraOrb1" Width="720" Height="720" Opacity="0.22" Canvas.Left="-120" Canvas.Top="-180">
+            <Ellipse Width="720" Height="720" Opacity="0.22" Canvas.Left="-120" Canvas.Top="-180">
                 <Ellipse.Fill>
                     <RadialGradientBrush>
                         <GradientStop Color="#8B5CF6" Offset="0"/>
@@ -38,7 +38,7 @@
                     </RadialGradientBrush>
                 </Ellipse.Fill>
             </Ellipse>
-            <Ellipse x:Name="AuroraOrb2" Width="640" Height="640" Opacity="0.18" Canvas.Right="-120" Canvas.Bottom="-180">
+            <Ellipse Width="640" Height="640" Opacity="0.18" Canvas.Right="-120" Canvas.Bottom="-180">
                 <Ellipse.Fill>
                     <RadialGradientBrush>
                         <GradientStop Color="#06B6D4" Offset="0"/>
@@ -60,7 +60,7 @@
                 <Grid>
                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="14,0,0,0">
                         <Image Source="/Assets/app_icon.png" Width="18" Height="18" RenderOptions.BitmapScalingMode="HighQuality" Margin="0,0,8,0"/>
-                        <TextBlock x:Name="TxtWindowTitle" Text="STORM CONNECT 1.0.0" FontSize="12" FontWeight="SemiBold"
+                        <TextBlock x:Name="TxtWindowTitle" Text="STORM CONNECT 1.1.0" FontSize="12" FontWeight="SemiBold"
                                    Foreground="{DynamicResource ThemeTextSecondary}" VerticalAlignment="Center"/>
                     </StackPanel>
 
@@ -78,7 +78,7 @@
                 </Grid>
             </Border>
 
-            <!-- ROW 1: Brand Header & 4 Dynamic Selectors (Responsive Multi-Row on narrow windows, Law 13, 17, 23) -->
+            <!-- ROW 1: Brand Header & 4 Dynamic Selectors (Responsive Multi-Row without clipping) -->
             <Border Grid.Row="1" Background="{DynamicResource ThemeBgSecondary}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="0,0,0,1" Padding="18,12">
                 <Grid x:Name="HeaderGrid">
                     <Grid.RowDefinitions>
@@ -90,22 +90,26 @@
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
 
-                    <!-- Brand Identity (Single space between STORM and CONNECT, NO version badge here) -->
-                    <StackPanel Grid.Row="0" Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                        <Image Source="/Assets/app_icon.png" Width="44" Height="44" RenderOptions.BitmapScalingMode="HighQuality" Margin="0,0,14,0"/>
-                        <StackPanel VerticalAlignment="Center">
+                    <!-- Brand Identity -->
+                    <Grid Grid.Row="0" Grid.Column="0" VerticalAlignment="Center" Margin="0,0,16,0">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Image Grid.Column="0" Source="/Assets/app_icon.png" Width="44" Height="44" RenderOptions.BitmapScalingMode="HighQuality" Margin="0,0,14,0" VerticalAlignment="Center"/>
+                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
                             <TextBlock FontSize="22" VerticalAlignment="Center"><Run Text="STORM" Foreground="{DynamicResource ThemeAccent}" FontWeight="Black"/><Run Text=" CONNECT" Foreground="{DynamicResource ThemeTextPrimary}" FontWeight="Bold"/></TextBlock>
-                            <TextBlock x:Name="TxtSubtitle" Text="High-Speed Multi-Monitor Remote Desktop, File Transfer &amp; Relay Suite"
-                                       FontSize="12" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,2,0,0" TextTrimming="CharacterEllipsis"/>
+                            <TextBlock x:Name="TxtSubtitle" Text="High-Speed Multi-Monitor Remote Desktop, File Transfer &amp; Serverless Relay Suite"
+                                       FontSize="12" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,2,0,0" TextWrapping="Wrap"/>
                         </StackPanel>
-                    </StackPanel>
+                    </Grid>
 
                     <!-- 4 Selectors + Updates + About -->
                     <WrapPanel x:Name="HeaderControlsPanel" Grid.Row="0" Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
-                        <ComboBox x:Name="CmbLang" Style="{StaticResource StormComboBox}" Width="126" Margin="0,0,8,4" SelectionChanged="CmbLang_SelectionChanged"/>
+                        <ComboBox x:Name="CmbLang" Style="{StaticResource StormComboBox}" Width="122" Margin="0,0,8,4" SelectionChanged="CmbLang_SelectionChanged"/>
                         <ComboBox x:Name="CmbTheme" Style="{StaticResource StormComboBox}" Width="134" Margin="0,0,8,4" SelectionChanged="CmbTheme_SelectionChanged"/>
                         <ComboBox x:Name="CmbAccent" Style="{StaticResource StormComboBox}" Width="132" Margin="0,0,8,4" SelectionChanged="CmbAccent_SelectionChanged"/>
-                        <ComboBox x:Name="CmbFont" Style="{StaticResource StormComboBox}" Width="138" Margin="0,0,8,4" SelectionChanged="CmbFont_SelectionChanged"/>
+                        <ComboBox x:Name="CmbFont" Style="{StaticResource StormComboBox}" Width="136" Margin="0,0,8,4" SelectionChanged="CmbFont_SelectionChanged"/>
                         <Button x:Name="BtnUpdates" Style="{StaticResource StormSecondaryBtn}" Margin="0,0,8,4" Click="BtnUpdates_Click">
                             <StackPanel Orientation="Horizontal">
                                 <Path Data="M 8 2 A 6 6 0 1 1 2.8 5 M 2 1.5 L 2 5.5 L 6 5.5" Stroke="#38BDF8" StrokeThickness="1.7" StrokeStartLineCap="Round" StrokeEndLineCap="Round" Width="15" Height="15" Stretch="Uniform" Margin="0,0,6,0"/>
@@ -122,14 +126,14 @@
                 </Grid>
             </Border>
 
-            <!-- ROW 2: Main Body (Left Navigation Rail + Content Area) -->
+            <!-- ROW 2: Main Body -->
             <Grid Grid.Row="2">
                 <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="228"/>
+                    <ColumnDefinition Width="232"/>
                     <ColumnDefinition Width="*"/>
                 </Grid.ColumnDefinitions>
 
-                <!-- Left Navigation Rail with 6 Unique Vector Icons -->
+                <!-- Left Navigation Rail -->
                 <Border Grid.Column="0" Background="{DynamicResource ThemeBgSecondary}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="0,0,1,0" Padding="12,14">
                     <DockPanel>
                         <StackPanel DockPanel.Dock="Bottom" Margin="4,10,4,0">
@@ -137,7 +141,7 @@
                                 <StackPanel>
                                     <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
                                         <Ellipse x:Name="DotRelayStatus" Width="9" Height="9" Fill="{DynamicResource ThemeSuccess}" Margin="0,0,8,0"/>
-                                        <TextBlock x:Name="TxtRelayBadge" Text="Relay Online" FontSize="12" FontWeight="SemiBold"/>
+                                        <TextBlock x:Name="TxtRelayBadge" Text="Direct / Serverless Ready" FontSize="12" FontWeight="SemiBold" TextWrapping="Wrap"/>
                                     </StackPanel>
                                     <TextBlock x:Name="TxtActiveGuestsBadge" Text="Active Guests: 0" FontSize="11.5" Foreground="{DynamicResource ThemeTextSecondary}"/>
                                 </StackPanel>
@@ -196,7 +200,6 @@
                     <!-- 1. DASHBOARD / CONNECT -->
                     <ScrollViewer x:Name="PanelDashboard" VerticalScrollBarVisibility="Auto" Padding="0,0,16,14">
                         <StackPanel>
-                            <!-- Top Row: Identity Card + Quick Connect Card -->
                             <Grid Margin="0,0,0,14">
                                 <Grid.ColumnDefinitions>
                                     <ColumnDefinition Width="*"/>
@@ -204,16 +207,19 @@
                                     <ColumnDefinition Width="1.25*"/>
                                 </Grid.ColumnDefinitions>
 
-                                <!-- My STORM ID Card -->
+                                <!-- My STORM ID & Serverless Invite Code Card -->
                                 <Border Grid.Column="0" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="18">
                                     <StackPanel>
                                         <TextBlock x:Name="TxtLabelMyId" Text="YOUR STORM ID" FontSize="11.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}"/>
-                                        <StackPanel Orientation="Horizontal" Margin="0,8,0,12">
-                                            <TextBlock x:Name="TxtMyStormId" Text="000 000 000" FontSize="30" FontWeight="Black" Foreground="{DynamicResource ThemeAccent}" VerticalAlignment="Center"/>
-                                            <Button x:Name="BtnCopyId" Style="{StaticResource StormSecondaryBtn}" Margin="14,0,0,0" Click="BtnCopyId_Click">
+                                        <WrapPanel Margin="0,8,0,10" VerticalAlignment="Center">
+                                            <TextBlock x:Name="TxtMyStormId" Text="000 000 000" FontSize="28" FontWeight="Black" Foreground="{DynamicResource ThemeAccent}" VerticalAlignment="Center" Margin="0,0,12,4"/>
+                                            <Button x:Name="BtnCopyId" Style="{StaticResource StormSecondaryBtn}" Margin="0,0,8,4" Click="BtnCopyId_Click">
                                                 <TextBlock x:Name="TxtBtnCopyId" Text="Copy ID"/>
                                             </Button>
-                                        </StackPanel>
+                                            <Button x:Name="BtnCopyInvite" Style="{StaticResource StormSecondaryBtn}" Margin="0,0,0,4" Click="BtnCopyInvite_Click">
+                                                <TextBlock x:Name="TxtBtnCopyInvite" Text="Copy Invite Code"/>
+                                            </Button>
+                                        </WrapPanel>
 
                                         <Grid Margin="0,0,0,12">
                                             <Grid.ColumnDefinitions>
@@ -237,14 +243,14 @@
                                 <Border Grid.Column="2" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="18">
                                     <StackPanel>
                                         <TextBlock x:Name="TxtLabelQuickConnect" Text="CONNECT TO REMOTE DEVICE" FontSize="11.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}"/>
-                                        <Grid Margin="0,10,0,12">
+                                        <Grid Margin="0,10,0,10">
                                             <Grid.ColumnDefinitions>
                                                 <ColumnDefinition Width="*"/>
                                                 <ColumnDefinition Width="10"/>
                                                 <ColumnDefinition Width="Auto"/>
                                             </Grid.ColumnDefinitions>
                                             <TextBox x:Name="TxtTargetInput" Style="{StaticResource StormInput}" KeyDown="TxtTargetInput_KeyDown"/>
-                                            <Button Grid.Column="2" x:Name="BtnConnect" Style="{StaticResource StormPrimaryBtn}" MinWidth="136" Click="BtnConnect_Click">
+                                            <Button Grid.Column="2" x:Name="BtnConnect" Style="{StaticResource StormPrimaryBtn}" MinWidth="142" Click="BtnConnect_Click">
                                                 <StackPanel Orientation="Horizontal">
                                                     <Path Data="M 7 1 L 2 9 L 7 9 L 5 15 L 14 6 L 8 6 Z" Fill="#FFFFFF" Width="14" Height="14" Stretch="Uniform" Margin="0,0,8,0"/>
                                                     <TextBlock x:Name="TxtBtnConnect" Text="Connect" Foreground="#FFFFFF"/>
@@ -252,11 +258,16 @@
                                             </Button>
                                         </Grid>
 
-                                        <TextBlock x:Name="TxtConnectStatus" Text="Ready. Enter a 9-digit STORM ID or LAN/WAN IP:Port."
-                                                   Foreground="{DynamicResource ThemeTextSecondary}" FontSize="12.5" TextWrapping="Wrap"/>
+                                        <!-- Connection Method Selector -->
+                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,10" VerticalAlignment="Center">
+                                            <TextBlock x:Name="TxtLabelConnMethod" Text="Connection Method:" FontSize="12" Foreground="{DynamicResource ThemeTextSecondary}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                            <ComboBox x:Name="CmbConnMethod" Style="{StaticResource StormComboBox}" Width="280" SelectionChanged="CmbConnMethod_SelectionChanged"/>
+                                        </StackPanel>
+
+                                        <TextBlock x:Name="TxtConnectStatus" Text="Ready." Foreground="{DynamicResource ThemeTextSecondary}" FontSize="12.5" TextWrapping="Wrap"/>
 
                                         <!-- Live Telemetry Strip -->
-                                        <WrapPanel Margin="0,14,0,0">
+                                        <WrapPanel Margin="0,12,0,0">
                                             <Border Background="{DynamicResource ThemeBgSecondary}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="8" Padding="12,7" Margin="0,0,8,6">
                                                 <TextBlock x:Name="BadgeFps" Text="FPS: 0" FontSize="12" FontWeight="Bold"/>
                                             </Border>
@@ -300,11 +311,10 @@
                             <RowDefinition Height="*"/>
                         </Grid.RowDefinitions>
 
-                        <!-- Viewer Toolbar -->
                         <Border Grid.Row="0" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="10" Padding="10" Margin="0,0,0,10">
                             <WrapPanel VerticalAlignment="Center">
-                                <ComboBox x:Name="CmbMonitorSelect" Style="{StaticResource StormComboBox}" Width="190" Margin="0,0,8,4" SelectionChanged="CmbMonitorSelect_SelectionChanged"/>
-                                <ComboBox x:Name="CmbQuality" Style="{StaticResource StormComboBox}" Width="118" Margin="0,0,8,4" SelectionChanged="CmbQuality_SelectionChanged"/>
+                                <ComboBox x:Name="CmbMonitorSelect" Style="{StaticResource StormComboBox}" Width="210" Margin="0,0,8,4" SelectionChanged="CmbMonitorSelect_SelectionChanged"/>
+                                <ComboBox x:Name="CmbQuality" Style="{StaticResource StormComboBox}" Width="140" Margin="0,0,8,4" SelectionChanged="CmbQuality_SelectionChanged"/>
                                 <Button x:Name="BtnAudioToggle" Style="{StaticResource StormSecondaryBtn}" Margin="0,0,8,4" Click="BtnAudioToggle_Click">
                                     <TextBlock x:Name="TxtBtnAudio" Text="Audio: ON"/>
                                 </Button>
@@ -338,7 +348,6 @@
                             </WrapPanel>
                         </Border>
 
-                        <!-- Viewport + Optional Chat Drawer -->
                         <Grid Grid.Row="1">
                             <Grid.ColumnDefinitions>
                                 <ColumnDefinition Width="*"/>
@@ -353,15 +362,12 @@
                                 <Grid>
                                     <Image x:Name="ImgRemoteScreen" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
                                     <StackPanel x:Name="ViewerEmptyState" VerticalAlignment="Center" HorizontalAlignment="Center">
-                                        <TextBlock x:Name="TxtNoActiveSession" Text="No active remote session. Connect from the Dashboard or Address Book."
-                                                   FontSize="15" Foreground="{DynamicResource ThemeTextSecondary}" HorizontalAlignment="Center" Margin="0,0,0,8"/>
-                                        <TextBlock x:Name="TxtDropFilesHint" Text="Drag &amp; Drop files onto the remote screen to upload immediately"
-                                                   FontSize="12.5" Foreground="{DynamicResource ThemeAccent}" HorizontalAlignment="Center"/>
+                                        <TextBlock x:Name="TxtNoActiveSession" Text="No active remote session." FontSize="15" Foreground="{DynamicResource ThemeTextSecondary}" HorizontalAlignment="Center" Margin="0,0,0,8"/>
+                                        <TextBlock x:Name="TxtDropFilesHint" Text="Drag &amp; Drop files here" FontSize="12.5" Foreground="{DynamicResource ThemeAccent}" HorizontalAlignment="Center"/>
                                     </StackPanel>
                                 </Grid>
                             </Border>
 
-                            <!-- Chat Side Drawer -->
                             <Border x:Name="PanelChatDrawer" Grid.Column="1" Width="280" Visibility="Collapsed" Margin="10,0,0,0"
                                     Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="10" Padding="12">
                                 <DockPanel>
@@ -397,7 +403,6 @@
                             <ColumnDefinition Width="*"/>
                         </Grid.ColumnDefinitions>
 
-                        <!-- Local Pane -->
                         <Border Grid.Row="0" Grid.Column="0" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="14">
                             <DockPanel>
                                 <TextBlock DockPanel.Dock="Top" x:Name="TxtLabelLocalFiles" Text="LOCAL COMPUTER" FontSize="11.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,0,0,8"/>
@@ -423,7 +428,6 @@
                             </DockPanel>
                         </Border>
 
-                        <!-- Remote Pane -->
                         <Border Grid.Row="0" Grid.Column="2" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="14">
                             <DockPanel>
                                 <TextBlock DockPanel.Dock="Top" x:Name="TxtLabelRemoteFiles" Text="REMOTE COMPUTER" FontSize="11.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,0,0,8"/>
@@ -452,7 +456,6 @@
                             </DockPanel>
                         </Border>
 
-                        <!-- Transfer Progress Bar -->
                         <Border Grid.Row="1" Grid.ColumnSpan="3" Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="10" Padding="12" Margin="0,12,0,0">
                             <Grid>
                                 <Grid.ColumnDefinitions>
@@ -460,7 +463,7 @@
                                     <ColumnDefinition Width="16"/>
                                     <ColumnDefinition Width="260"/>
                                 </Grid.ColumnDefinitions>
-                                <TextBlock x:Name="TxtFileTransferStatus" Text="Ready for file transfer (Drag &amp; Drop supported)" VerticalAlignment="Center" Foreground="{DynamicResource ThemeTextSecondary}"/>
+                                <TextBlock x:Name="TxtFileTransferStatus" Text="Ready" VerticalAlignment="Center" Foreground="{DynamicResource ThemeTextSecondary}"/>
                                 <ProgressBar Grid.Column="2" x:Name="PbFileTransfer" Height="12" Minimum="0" Maximum="100" Value="0"/>
                             </Grid>
                         </Border>
@@ -488,15 +491,15 @@
                                     <DataGridTextColumn x:Name="ColBookHost" Header="HOST / IP" Binding="{Binding HostOrIp}" Width="150"/>
                                     <DataGridTextColumn x:Name="ColBookGroup" Header="GROUP" Binding="{Binding Group}" Width="120"/>
                                     <DataGridTextColumn x:Name="ColBookMac" Header="MAC (WOL)" Binding="{Binding MacAddress}" Width="145"/>
-                                    <DataGridTemplateColumn x:Name="ColBookActions" Header="ACTIONS" Width="210">
+                                    <DataGridTemplateColumn x:Name="ColBookActions" Header="ACTIONS" Width="230">
                                         <DataGridTemplateColumn.CellTemplate>
                                             <DataTemplate>
                                                 <StackPanel Orientation="Horizontal">
                                                     <Button Style="{StaticResource StormPrimaryBtn}" Padding="10,4" Margin="0,0,6,0" Click="BtnBookConnect_Click" Tag="{Binding}">
-                                                        <TextBlock Text="Connect" FontSize="11.5" Foreground="#FFFFFF"/>
+                                                        <TextBlock Text="{Binding ConnectLabel}" FontSize="11.5" Foreground="#FFFFFF"/>
                                                     </Button>
                                                     <Button Style="{StaticResource StormSecondaryBtn}" Padding="8,4" Margin="0,0,6,0" Click="BtnBookWol_Click" Tag="{Binding}">
-                                                        <TextBlock Text="WOL" FontSize="11.5"/>
+                                                        <TextBlock Text="{Binding WolLabel}" FontSize="11.5"/>
                                                     </Button>
                                                     <Button Style="{StaticResource StormSecondaryBtn}" Padding="8,4" Click="BtnBookDelete_Click" Tag="{Binding}">
                                                         <TextBlock Text="X" FontSize="11.5" Foreground="{DynamicResource ThemeError}"/>
@@ -510,9 +513,25 @@
                         </DockPanel>
                     </Border>
 
-                    <!-- 5. NETWORK & RELAY -->
+                    <!-- 5. NETWORK, SERVERLESS DIRECT ACCESS & RELAY -->
                     <ScrollViewer x:Name="PanelNetwork" Visibility="Collapsed" VerticalScrollBarVisibility="Auto" Padding="0,0,16,14">
                         <StackPanel>
+                            <!-- Serverless Direct Access Info Card -->
+                            <Border Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="18" Margin="0,0,0,14">
+                                <StackPanel>
+                                    <TextBlock x:Name="TxtLabelServerlessTitle" Text="DIRECT SERVERLESS ACCESS (NO SERVER REQUIRED)" FontSize="11.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,0,0,10"/>
+                                    <TextBlock x:Name="TxtDirectAddresses" Text="LAN / VPN / IPv6 / UPnP / STUN..." FontSize="13" TextWrapping="Wrap" Margin="0,0,0,12"/>
+                                    <WrapPanel>
+                                        <Button x:Name="BtnRefreshNetMap" Style="{StaticResource StormPrimaryBtn}" Margin="0,0,10,6" Click="BtnRefreshNetMap_Click">
+                                            <TextBlock x:Name="TxtBtnRefreshNetMap" Text="Refresh NAT / UPnP" Foreground="#FFFFFF"/>
+                                        </Button>
+                                        <Button Style="{StaticResource StormSecondaryBtn}" Margin="0,0,0,6" Click="BtnCopyInvite_Click">
+                                            <TextBlock x:Name="TxtBtnNetCopyInvite" Text="Copy Invite Code"/>
+                                        </Button>
+                                    </WrapPanel>
+                                </StackPanel>
+                            </Border>
+
                             <Border Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="18" Margin="0,0,0,14">
                                 <StackPanel>
                                     <TextBlock x:Name="TxtLabelRelayUrl" Text="STORM CONNECT Relay URL (WSS)" FontWeight="SemiBold" Margin="0,0,0,6"/>
@@ -531,8 +550,7 @@
                             <Border Background="{DynamicResource ThemeCardBg}" BorderBrush="{DynamicResource ThemeCardBorder}" BorderThickness="1" CornerRadius="12" Padding="18">
                                 <StackPanel>
                                     <TextBlock x:Name="TxtLabelEmbeddedRelay" Text="Run Embedded Team Relay Hub on this PC" FontSize="15" FontWeight="Bold" Margin="0,0,0,8"/>
-                                    <TextBlock x:Name="TxtDeployNote" Text="Use the included deploy/ folder (Docker / systemd / Nginx) to host your private relay on any domain."
-                                               Foreground="{DynamicResource ThemeTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,12"/>
+                                    <TextBlock x:Name="TxtDeployNote" Text="Use deploy/ for private relay." Foreground="{DynamicResource ThemeTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,12"/>
                                     <StackPanel Orientation="Horizontal">
                                         <Button x:Name="BtnToggleEmbeddedRelay" Style="{StaticResource StormPrimaryBtn}" Click="BtnToggleEmbeddedRelay_Click">
                                             <TextBlock x:Name="TxtBtnEmbeddedRelay" Text="Start Local Hub" Foreground="#FFFFFF"/>
@@ -564,7 +582,7 @@
                                     <CheckBox x:Name="ChkPermClipboard" Content="Allow Two-Way Clipboard Sync" IsChecked="True" Margin="0,0,0,8" Checked="Perm_Changed" Unchecked="Perm_Changed"/>
                                     <CheckBox x:Name="ChkPermFiles" Content="Allow File Transfer" IsChecked="True" Margin="0,0,0,8" Checked="Perm_Changed" Unchecked="Perm_Changed"/>
                                     <CheckBox x:Name="ChkPermAudio" Content="Allow Audio Streaming" IsChecked="True" Margin="0,0,0,8" Checked="Perm_Changed" Unchecked="Perm_Changed"/>
-                                    <CheckBox x:Name="ChkPermSystem" Content="Allow System Actions (Lock / Task Manager)" IsChecked="True" Margin="0,0,0,14" Checked="Perm_Changed" Unchecked="Perm_Changed"/>
+                                    <CheckBox x:Name="ChkPermSystem" Content="Allow System Actions" IsChecked="True" Margin="0,0,0,14" Checked="Perm_Changed" Unchecked="Perm_Changed"/>
 
                                     <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
                                         <TextBlock x:Name="TxtLabelUiScale" Text="Interface Scale" VerticalAlignment="Center" Margin="0,0,12,0"/>
@@ -593,17 +611,16 @@
             </Grid>
         </Grid>
 
-        <!-- MODAL OVERLAYS (All dismissible via ESC, Law 16) -->
-        <!-- 1. Incoming Connection Consent Modal -->
+        <!-- MODAL OVERLAYS (All dismissible via ESC) -->
         <Grid x:Name="ModalConsent" Visibility="Collapsed" Background="#B0000000">
             <Border Width="480" VerticalAlignment="Center" HorizontalAlignment="Center" Background="{DynamicResource ThemeHeaderBg}"
                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1.5" CornerRadius="14" Padding="24">
                 <StackPanel>
                     <TextBlock x:Name="TxtConsentTitle" Text="INCOMING CONNECTION REQUEST" FontSize="16" FontWeight="Black" Foreground="{DynamicResource ThemeAccent}" Margin="0,0,0,10"/>
                     <TextBlock x:Name="TxtConsentDetails" Text="" FontSize="13.5" TextWrapping="Wrap" Margin="0,0,0,14"/>
-                    <CheckBox x:Name="ChkConsentControl" Content="Allow Mouse &amp; Keyboard Control" IsChecked="True" Margin="0,0,0,6"/>
-                    <CheckBox x:Name="ChkConsentClipboard" Content="Allow Clipboard Sync" IsChecked="True" Margin="0,0,0,6"/>
-                    <CheckBox x:Name="ChkConsentFiles" Content="Allow File Transfer" IsChecked="True" Margin="0,0,0,6"/>
+                    <CheckBox x:Name="ChkConsentControl" Content="Allow Mouse &amp; Keyboard Control" IsChecked="True" Margin="0,0,0,8"/>
+                    <CheckBox x:Name="ChkConsentClipboard" Content="Allow Clipboard Sync" IsChecked="True" Margin="0,0,0,8"/>
+                    <CheckBox x:Name="ChkConsentFiles" Content="Allow File Transfer" IsChecked="True" Margin="0,0,0,8"/>
                     <CheckBox x:Name="ChkConsentAudio" Content="Allow Audio" IsChecked="True" Margin="0,0,0,16"/>
                     <WrapPanel HorizontalAlignment="Right">
                         <Button Style="{StaticResource StormSecondaryBtn}" Margin="0,0,8,0" Click="BtnConsentDecline_Click"><TextBlock x:Name="TxtConsentDecline" Text="Decline"/></Button>
@@ -614,7 +631,6 @@
             </Border>
         </Grid>
 
-        <!-- 2. Outgoing Auth Password/PIN Modal -->
         <Grid x:Name="ModalAuth" Visibility="Collapsed" Background="#B0000000">
             <Border Width="430" VerticalAlignment="Center" HorizontalAlignment="Center" Background="{DynamicResource ThemeHeaderBg}"
                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1.5" CornerRadius="14" Padding="24">
@@ -630,17 +646,16 @@
             </Border>
         </Grid>
 
-        <!-- 3. Add Address Book Device Modal -->
         <Grid x:Name="ModalAddDevice" Visibility="Collapsed" Background="#B0000000">
             <Border Width="440" VerticalAlignment="Center" HorizontalAlignment="Center" Background="{DynamicResource ThemeHeaderBg}"
                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1.5" CornerRadius="14" Padding="24">
                 <StackPanel>
                     <TextBlock x:Name="TxtAddDevTitle" Text="Add Device" FontSize="16" FontWeight="Black" Foreground="{DynamicResource ThemeAccent}" Margin="0,0,0,12"/>
-                    <TextBox x:Name="TxtAddAlias" Style="{StaticResource StormInput}" Margin="0,0,0,8" ToolTip="Alias"/>
-                    <TextBox x:Name="TxtAddStormId" Style="{StaticResource StormInput}" Margin="0,0,0,8" ToolTip="STORM ID"/>
-                    <TextBox x:Name="TxtAddHost" Style="{StaticResource StormInput}" Margin="0,0,0,8" ToolTip="Host / IP"/>
-                    <TextBox x:Name="TxtAddMac" Style="{StaticResource StormInput}" Margin="0,0,0,8" ToolTip="MAC Address (XX:XX:XX:XX:XX:XX)"/>
-                    <TextBox x:Name="TxtAddGroup" Style="{StaticResource StormInput}" Text="Workstations" Margin="0,0,0,16" ToolTip="Group"/>
+                    <TextBox x:Name="TxtAddAlias" Style="{StaticResource StormInput}" Margin="0,0,0,8"/>
+                    <TextBox x:Name="TxtAddStormId" Style="{StaticResource StormInput}" Margin="0,0,0,8"/>
+                    <TextBox x:Name="TxtAddHost" Style="{StaticResource StormInput}" Margin="0,0,0,8"/>
+                    <TextBox x:Name="TxtAddMac" Style="{StaticResource StormInput}" Margin="0,0,0,8"/>
+                    <TextBox x:Name="TxtAddGroup" Style="{StaticResource StormInput}" Text="Workstations" Margin="0,0,0,16"/>
                     <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
                         <Button Style="{StaticResource StormSecondaryBtn}" Margin="0,0,8,0" Click="BtnAddDevCancel_Click"><TextBlock x:Name="TxtAddDevCancel" Text="Cancel"/></Button>
                         <Button Style="{StaticResource StormPrimaryBtn}" Click="BtnAddDevSave_Click"><TextBlock x:Name="TxtAddDevSave" Text="OK" Foreground="#FFFFFF"/></Button>
@@ -649,7 +664,6 @@
             </Border>
         </Grid>
 
-        <!-- 4. Auto-Update Modal (Law 9) -->
         <Grid x:Name="ModalUpdate" Visibility="Collapsed" Background="#B0000000">
             <Border Width="480" VerticalAlignment="Center" HorizontalAlignment="Center" Background="{DynamicResource ThemeHeaderBg}"
                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1.5" CornerRadius="14" Padding="24">
@@ -668,7 +682,6 @@
             </Border>
         </Grid>
 
-        <!-- 5. About Modal (Law 14: crisp app_icon.png) -->
         <Grid x:Name="ModalAbout" Visibility="Collapsed" Background="#B0000000">
             <Border Width="460" VerticalAlignment="Center" HorizontalAlignment="Center" Background="{DynamicResource ThemeHeaderBg}"
                     BorderBrush="{DynamicResource ThemeAccent}" BorderThickness="1.5" CornerRadius="14" Padding="26">
@@ -677,7 +690,7 @@
                         <Image Source="/Assets/app_icon.png" Width="64" Height="64" RenderOptions.BitmapScalingMode="HighQuality" Margin="0,0,16,0"/>
                         <StackPanel VerticalAlignment="Center">
                             <TextBlock FontSize="22"><Run Text="STORM" Foreground="{DynamicResource ThemeAccent}" FontWeight="Black"/><Run Text=" CONNECT" FontWeight="Bold"/></TextBlock>
-                            <TextBlock x:Name="TxtAboutVersion" Text="1.0.0" FontSize="13.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,3,0,0"/>
+                            <TextBlock x:Name="TxtAboutVersion" Text="1.1.0" FontSize="13.5" FontWeight="Bold" Foreground="{DynamicResource ThemeTextSecondary}" Margin="0,3,0,0"/>
                         </StackPanel>
                     </StackPanel>
                     <TextBlock x:Name="TxtAboutDesc" Text="" FontSize="13" Foreground="{DynamicResource ThemeTextSecondary}" TextWrapping="Wrap" Margin="0,0,0,18"/>

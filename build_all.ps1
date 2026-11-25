@@ -7,7 +7,7 @@ try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.
 $baseDir = $PSScriptRoot
 if (-not $baseDir) { $baseDir = "f:\STORM CONNECT" }
 
-$appVersion = "1.0.0"
+$appVersion = "1.1.0"
 $appDisplayName = "STORM CONNECT"
 $filesDir = Join-Path $baseDir "Files"
 $secretsDir = "F:\STORM ALL PROJECTS\.storm-secrets"
@@ -18,8 +18,9 @@ $testsProj = Join-Path $baseDir "tests\StormConnect.Tests\StormConnect.Tests.csp
 $androidDir = Join-Path $baseDir "android"
 
 New-Item -ItemType Directory -Path $filesDir -Force | Out-Null
+Get-ChildItem $filesDir -Filter "STORM_CONNECT_*" -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Path $payloadDir -Force | Out-Null
-Get-Process "STORM CONNECT", "STORM_CONNECT_1.0.0_Setup" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Get-Process "STORM CONNECT", "STORM_CONNECT_*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 Write-Host "=================================================================" -ForegroundColor Cyan
 Write-Host "   $appDisplayName $appVersion - FULL PRODUCTION PIPELINE" -ForegroundColor Cyan

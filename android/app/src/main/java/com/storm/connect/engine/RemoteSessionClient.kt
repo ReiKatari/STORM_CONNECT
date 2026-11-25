@@ -195,11 +195,13 @@ class RemoteSessionClient(
                 val trimmed = targetInput.trim()
                 val digits = trimmed.filter { it.isDigit() }
                 val rawChannel: TransportChannel = when {
+                    trimmed.startsWith("SC1-", ignoreCase = true) -> {
+                        onStatus?.invoke("Connecting via Direct Invite Code...")
+                        connectViaInviteCode(trimmed, relayUrl, lanDevices)
+                    }
                     digits.length != 9 || trimmed.contains('.') || trimmed.contains(':') -> {
                         onStatus?.invoke("Connecting Direct IP...")
-                        val parts = trimmed.split(':')
-                        val host = parts[0]
-                        val port = parts.getOrNull(1)?.toIntOrNull() ?: ProtocolConstants.DEFAULT_DIRECT_PORT
+                        val (host, port) = parseHostPort(trimmed, ProtocolConstants.DEFAULT_DIRECT_PORT)
                         TcpTransportChannel.connect(host, port, "DirectIp")
                     }
                     else -> {
@@ -273,6 +275,61 @@ class RemoteSessionClient(
                 disconnect()
             }
         }
+    }
+
+    private fun parseHostPort(spec: String, defaultPort: Int): Pair<String, Int> {
+        val s = spec.trim()
+        if (s.startsWith("[")) {
+            val end = s.indexOf(']')
+            if (end > 0) {
+                val host = s.substring(1, end)
+                val port = if (end + 2 <= s.length && s[end + 1] == ':') s.substring(end + 2).toIntOrNull() ?: defaultPort else defaultPort
+                return host to port
+            }
+        }
+        val first = s.indexOf(':')
+        val last = s.lastIndexOf(':')
+        if (first == last && last > 0) {
+            val p = s.substring(last + 1).toIntOrNull()
+            if (p != null) return s.substring(0, last) to p
+        }
+        return s to defaultPort
+    }
+
+    private suspend fun connectViaInviteCode(
+        code: String,
+        relayUrl: String,
+        lanDevices: List<DiscoveredLanDevice>
+    ): TransportChannel {
+        val b64 = code.substring(4).replace('-', '+').replace('_', '/')
+        val padded = when (b64.length % 4) {
+            2 -> "$b64=="
+            3 -> "$b64="
+            else -> b64
+        }
+        val json = JSONObject(String(Base64.getDecoder().decode(padded), Charsets.UTF_8))
+        val stormId = json.optString("StormId", "").filter { it.isDigit() }
+        val directPort = json.optInt("DirectPort", ProtocolConstants.DEFAULT_DIRECT_PORT)
+
+        val candidates = mutableListOf<Triple<String, Int, String>>()
+        lanDevices.firstOrNull { it.stormId == stormId }?.let {
+            candidates.add(Triple(it.localIp, it.directPort, "LanDirect"))
+        }
+        json.optString("LanIp").takeIf { it.isNotBlank() }?.let { candidates.add(Triple(it, directPort, "LanDirect")) }
+        json.optString("VpnIp").takeIf { it.isNotBlank() }?.let { candidates.add(Triple(it, directPort, "DirectIp")) }
+        json.optString("GlobalIpv6").takeIf { it.isNotBlank() }?.let { candidates.add(Triple(it, directPort, "DirectIp")) }
+        val pub4 = json.optString("PublicIpv4")
+        val mappedPort = json.optInt("MappedTcpPort", 0)
+        if (pub4.isNotBlank() && mappedPort > 0) {
+            candidates.add(Triple(pub4, mappedPort, "DirectIp"))
+        }
+
+        for ((host, port, mode) in candidates.distinctBy { "${it.first}:${it.second}" }) {
+            try {
+                return TcpTransportChannel.connect(host, port, mode)
+            } catch (_: Exception) {}
+        }
+        return connectViaRelay(stormId, relayUrl)
     }
 
     private suspend fun connectViaRelay(targetId: String, relayUrl: String): TransportChannel {
