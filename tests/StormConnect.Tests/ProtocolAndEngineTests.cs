@@ -725,4 +725,133 @@ public sealed class ProtocolAndEngineTests
         Assert.False(consentTriggered);
         Assert.False(clientModalTriggered);
     }
+
+    [Fact]
+    public void EncodeWithSizeBudget_Hits11KbSingleChunkTarget()
+    {
+        int w = 1920, h = 1080;
+        var px = new byte[w * h * 4];
+        new Random(456).NextBytes(px);
+        for (int i = 3; i < px.Length; i += 4) px[i] = 255;
+        var frame = new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px };
+
+        var enc = new TileDeltaEncoder();
+        var upd = enc.EncodeWithSizeBudget(frame, 38, forceFullFrame: true, maxWidth: 800, maxPacketBytes: 11 * 1024);
+        Assert.NotNull(upd);
+        var wire = TileDeltaEncoder.SerializeVideoUpdate(upd!);
+        Assert.True(wire.Length <= 11 * 1024, $"Expected <= 11KB instant first frame, got {wire.Length} bytes");
+    }
+
+    [Fact]
+    public async Task MqttPipe_TransparentReconnect_SurvivesAbruptSocketDrop()
+    {
+        string broker = ProtocolConstants.PublicMqttWssBrokers[0];
+        string tok = Guid.NewGuid().ToString("N");
+
+        var mqttH = new MqttWssClient();
+        var mqttC = new MqttWssClient();
+        await mqttH.ConnectAsync(broker, "test_h_" + tok[..6]);
+        await mqttC.ConnectAsync(broker, "test_c_" + tok[..6]);
+
+        var pipeH = new MqttPipeTransportChannel(mqttH, tok, isInitiator: false);
+        var pipeC = new MqttPipeTransportChannel(mqttC, tok, isInitiator: true);
+        await pipeH.SubscribeRxAsync();
+        await pipeC.SubscribeRxAsync();
+
+        using var keyH = new CryptoSession();
+        using var keyC = new CryptoSession();
+        await pipeH.SendPacketAsync(PacketType.KeyExchange, keyH.LocalPublicKeyUncompressed);
+        var pkH = await pipeC.ReceivePacketAsync();
+        Assert.NotNull(pkH);
+        await pipeC.SendPacketAsync(PacketType.KeyExchange, keyC.LocalPublicKeyUncompressed);
+        var pkC = await pipeH.ReceivePacketAsync();
+        Assert.NotNull(pkC);
+
+        keyC.DeriveKeys(pkH!.Payload, isInitiator: true);
+        keyH.DeriveKeys(pkC!.Payload, isInitiator: false);
+
+        await using var encH = new EncryptedTransportChannel(pipeH, keyH);
+        await using var encC = new EncryptedTransportChannel(pipeC, keyC);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+        var pongTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hostLoop = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested && encH.IsConnected)
+            {
+                var p = await encH.ReceivePacketAsync(cts.Token);
+                if (p is null) break;
+                if (p.Type == PacketType.Ping)
+                    await encH.SendPacketAsync(PacketType.Pong, p.Payload, ct: cts.Token);
+            }
+        });
+        var cliLoop = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested && encC.IsConnected)
+            {
+                var p = await encC.ReceivePacketAsync(cts.Token);
+                if (p is null) break;
+                if (p.Type == PacketType.Pong)
+                    pongTcs.TrySetResult(Encoding.UTF8.GetString(p.Payload));
+            }
+        });
+
+        await encC.SendPacketAsync(PacketType.Ping, Encoding.UTF8.GetBytes("before-drop"), ct: cts.Token);
+        Assert.Equal("before-drop", await pongTcs.Task.WaitAsync(TimeSpan.FromSeconds(6)));
+
+        // Simulate abrupt WebSocket/TCP RST drop mid-session on client side
+        pongTcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reconnectedTcs = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipeC.Reconnected += cnt => reconnectedTcs.TrySetResult(cnt);
+        encC.ForceAbortInnerForTest();
+
+        await Task.Delay(500);
+        await encC.SendPacketAsync(PacketType.Ping, Encoding.UTF8.GetBytes("after-drop"), ct: cts.Token);
+        Assert.Equal("after-drop", await pongTcs.Task.WaitAsync(TimeSpan.FromSeconds(10)));
+        Assert.True(encC.InnerReconnectCount >= 1);
+        cts.Cancel();
+        try { await Task.WhenAll(hostLoop, cliLoop); } catch { }
+    }
+
+    [Fact]
+    public async Task HostServer_DisposeDuringActiveVideo_NoSemaphoreDisposedError()
+    {
+        const string hostId = "944111222";
+        const string clientId = "944333444";
+        const string pin = "334455";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        var auditErrors = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        host.AuditLogEvent += m =>
+        {
+            if (m.Contains("SemaphoreSlim", StringComparison.OrdinalIgnoreCase) ||
+                m.Contains("ObjectDisposed", StringComparison.OrdinalIgnoreCase))
+            {
+                auditErrors.Enqueue(m);
+            }
+        };
+
+        host.Start(0, "", enableRelay: false);
+        while (host.ListeningPort == 0) await Task.Delay(20);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        var frameTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.FrameDimensionsReceived += (_, _) => frameTcs.TrySetResult();
+
+        await client.ConnectAsync($"127.0.0.1:{host.ListeningPort}", "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin));
+        await frameTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await host.DisposeAsync();
+        Assert.Empty(auditErrors);
+    }
 }

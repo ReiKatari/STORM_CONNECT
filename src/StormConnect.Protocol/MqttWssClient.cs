@@ -9,7 +9,7 @@ namespace StormConnect.Protocol;
 
 /// <summary>
 /// Minimal, zero-dependency RFC-compliant MQTT 3.1.1 client over WebSocket (Sec-WebSocket-Protocol: mqtt)
-/// with strict per-PacketId SUBACK awaiting and 28 KB broker-safe chunking.
+/// with strict per-PacketId SUBACK awaiting and clean shutdown safety.
 /// </summary>
 public sealed class MqttWssClient : IAsyncDisposable
 {
@@ -20,10 +20,11 @@ public sealed class MqttWssClient : IAsyncDisposable
     private readonly TaskCompletionSource _connAckTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly ConcurrentDictionary<ushort, TaskCompletionSource> _pendingSubAcks = new();
     private int _nextPacketId = 1;
+    private int _disposed;
     private Task? _rxTask;
     private Task? _pingTask;
 
-    public bool IsConnected => _ws.State == WebSocketState.Open;
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && _ws.State == WebSocketState.Open;
     public string BrokerUrl { get; private set; } = string.Empty;
     public string? CloseReason { get; private set; }
 
@@ -31,7 +32,7 @@ public sealed class MqttWssClient : IAsyncDisposable
     {
         BrokerUrl = brokerUrl;
         _ws.Options.AddSubProtocol("mqtt");
-        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
+        _ws.Options.KeepAliveInterval = TimeSpan.FromSeconds(12);
         await _ws.ConnectAsync(new Uri(brokerUrl), ct).ConfigureAwait(false);
 
         _rxTask = Task.Run(() => ReceiveLoopAsync(_cts.Token));
@@ -74,6 +75,11 @@ public sealed class MqttWssClient : IAsyncDisposable
         return SendRawAsync(pkt, ct);
     }
 
+    public void ForceAbortForTest()
+    {
+        try { _ws.Abort(); } catch { }
+    }
+
     public async Task<(string Topic, byte[] Payload)?> ReadMessageAsync(CancellationToken ct = default)
     {
         try
@@ -88,11 +94,15 @@ public sealed class MqttWssClient : IAsyncDisposable
 
     private async Task SendRawAsync(byte[] bytes, CancellationToken ct)
     {
+        if (Volatile.Read(ref _disposed) != 0)
+            throw new ObjectDisposedException(nameof(MqttWssClient));
+
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            if (_ws.State == WebSocketState.Open)
-                await _ws.SendAsync(bytes, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
+            if (Volatile.Read(ref _disposed) != 0 || _ws.State != WebSocketState.Open)
+                throw new WebSocketException(WebSocketError.InvalidState, CloseReason ?? "WebSocket is not open.");
+            await _ws.SendAsync(bytes, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
         }
         finally
         {
@@ -103,11 +113,12 @@ public sealed class MqttWssClient : IAsyncDisposable
     private async Task PingLoopAsync(CancellationToken ct)
     {
         byte[] pingReq = [0xC0, 0x00];
-        while (!ct.IsCancellationRequested && _ws.State == WebSocketState.Open)
+        while (!ct.IsCancellationRequested && IsConnected)
         {
             try
             {
-                await Task.Delay(15000, ct).ConfigureAwait(false);
+                await Task.Delay(10000, ct).ConfigureAwait(false);
+                if (!IsConnected) break;
                 await SendRawAsync(pingReq, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { break; }
@@ -299,47 +310,117 @@ public sealed class MqttWssClient : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        _cts.Cancel();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        try { _cts.Cancel(); } catch { }
         try
         {
             if (_ws.State == WebSocketState.Open)
                 await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None).ConfigureAwait(false);
         }
         catch { }
-        _sendLock.Dispose();
-        _ws.Dispose();
-        _cts.Dispose();
+        try { _ws.Dispose(); } catch { }
+        try { _cts.Dispose(); } catch { }
     }
 }
 
 /// <summary>
-/// Full ITransportChannel over MQTT-over-WSS with automatic 60 KB atomic packet chunking &amp; reassembly.
+/// Full ITransportChannel over MQTT-over-WSS with 12 KB DPI-safe chunking and transparent auto-reconnect.
 /// </summary>
 public sealed class MqttPipeTransportChannel : ITransportChannel
 {
-    private const int MaxChunkBody = 60 * 1024;
-    private readonly MqttWssClient _mqtt;
+    private const int MaxChunkBody = 12 * 1024;
+    private volatile MqttWssClient _mqtt;
+    private readonly string _brokerUrl;
+    private readonly string _sessionToken;
+    private readonly bool _isInitiator;
+    private readonly string _clientIdPrefix;
     private readonly string _txTopic;
     private readonly string _rxTopic;
     private readonly SemaphoreSlim _txLock = new(1, 1);
+    private readonly SemaphoreSlim _reconnectLock = new(1, 1);
     private int _nextMsgId;
+    private int _reconnectCount;
+    private int _disposed;
+    private volatile bool _reconnecting;
     private readonly ConcurrentDictionary<int, (int TotalLen, int ReceivedParts, byte[][] Parts, DateTime CreatedUtc)> _assemblies = new();
 
     public ConnectionMode Mode => ConnectionMode.WssRelay;
-    public bool IsConnected => _mqtt.IsConnected;
+    public string BrokerUrl => _brokerUrl;
+    public int ReconnectCount => Volatile.Read(ref _reconnectCount);
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && (_mqtt.IsConnected || _reconnecting);
     public string? CloseReason => _mqtt.CloseReason;
+    public event Action<int>? Reconnected;
 
-    public MqttPipeTransportChannel(MqttWssClient mqtt, string sessionToken, bool isInitiator)
+    public MqttPipeTransportChannel(MqttWssClient mqtt, string sessionToken, bool isInitiator, string? clientIdPrefix = null)
     {
         _mqtt = mqtt;
+        _brokerUrl = mqtt.BrokerUrl;
+        _sessionToken = sessionToken;
+        _isInitiator = isInitiator;
+        _clientIdPrefix = string.IsNullOrWhiteSpace(clientIdPrefix) ? (isInitiator ? "sc_c" : "sc_h") : clientIdPrefix;
         _txTopic = isInitiator ? $"sc/v1/p/{sessionToken}/c2h" : $"sc/v1/p/{sessionToken}/h2c";
         _rxTopic = isInitiator ? $"sc/v1/p/{sessionToken}/h2c" : $"sc/v1/p/{sessionToken}/c2h";
     }
 
     public Task SubscribeRxAsync(CancellationToken ct = default) => _mqtt.SubscribeAsync(_rxTopic, ct);
 
+    public void ForceAbortForTest() => _mqtt.ForceAbortForTest();
+
+    private async Task<bool> TryTransparentReconnectAsync(MqttWssClient failedClient, CancellationToken ct)
+    {
+        if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested || string.IsNullOrWhiteSpace(_brokerUrl))
+            return false;
+
+        await _reconnectLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested)
+                return false;
+
+            if (!ReferenceEquals(_mqtt, failedClient) && _mqtt.IsConnected)
+                return true;
+
+            _reconnecting = true;
+            int[] backoffsMs = [200, 400, 700, 1000, 1500, 2000];
+            foreach (int delayMs in backoffsMs)
+            {
+                if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested)
+                    return false;
+
+                var fresh = new MqttWssClient();
+                try
+                {
+                    using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    attemptCts.CancelAfter(TimeSpan.FromSeconds(5));
+                    string cid = $"{_clientIdPrefix}_r_{Guid.NewGuid().ToString("N")[..6]}";
+                    await fresh.ConnectAsync(_brokerUrl, cid, attemptCts.Token).ConfigureAwait(false);
+                    await fresh.SubscribeAsync(_rxTopic, attemptCts.Token).ConfigureAwait(false);
+
+                    _mqtt = fresh;
+                    int cnt = Interlocked.Increment(ref _reconnectCount);
+                    _ = Task.Run(async () => { try { await failedClient.DisposeAsync().ConfigureAwait(false); } catch { } });
+                    Reconnected?.Invoke(cnt);
+                    return true;
+                }
+                catch
+                {
+                    try { await fresh.DisposeAsync().ConfigureAwait(false); } catch { }
+                    try { await Task.Delay(delayMs, ct).ConfigureAwait(false); } catch { return false; }
+                }
+            }
+            return false;
+        }
+        finally
+        {
+            _reconnecting = false;
+            _reconnectLock.Release();
+        }
+    }
+
     public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
         byte flags = 0;
         byte[] data;
         if (compress && payload.Length > 256)
@@ -358,22 +439,40 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
         await _txLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            int msgId = Interlocked.Increment(ref _nextMsgId);
-            for (int p = 0; p < partCount; p++)
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            for (int attempt = 0; attempt < 2; attempt++)
             {
-                if (p > 0)
-                    await Task.Delay(5, ct).ConfigureAwait(false);
+                var cur = _mqtt;
+                int msgId = Interlocked.Increment(ref _nextMsgId);
+                try
+                {
+                    if (!cur.IsConnected)
+                        throw new WebSocketException(WebSocketError.InvalidState, "MQTT client disconnected before send.");
 
-                int off = p * MaxChunkBody;
-                int len = Math.Min(MaxChunkBody, rawFrame.Length - off);
-                var chunk = new byte[12 + len];
-                BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(0, 4), msgId);
-                BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), (ushort)p);
-                BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(6, 2), (ushort)partCount);
-                BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(8, 4), rawFrame.Length);
-                Buffer.BlockCopy(rawFrame, off, chunk, 12, len);
+                    for (int p = 0; p < partCount; p++)
+                    {
+                        if (p > 0)
+                            await Task.Delay(6, ct).ConfigureAwait(false);
 
-                await _mqtt.PublishAsync(_txTopic, chunk, ct).ConfigureAwait(false);
+                        int off = p * MaxChunkBody;
+                        int len = Math.Min(MaxChunkBody, rawFrame.Length - off);
+                        var chunk = new byte[12 + len];
+                        BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(0, 4), msgId);
+                        BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), (ushort)p);
+                        BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(6, 2), (ushort)partCount);
+                        BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(8, 4), rawFrame.Length);
+                        Buffer.BlockCopy(rawFrame, off, chunk, 12, len);
+
+                        await cur.PublishAsync(_txTopic, chunk, ct).ConfigureAwait(false);
+                    }
+                    return;
+                }
+                catch (Exception ex) when (attempt == 0 && ex is not OperationCanceledException && Volatile.Read(ref _disposed) == 0 && !ct.IsCancellationRequested)
+                {
+                    if (!await TryTransparentReconnectAsync(cur, ct).ConfigureAwait(false))
+                        throw;
+                }
             }
         }
         finally
@@ -384,10 +483,18 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
 
     public async Task<SconPacket?> ReceivePacketAsync(CancellationToken ct = default)
     {
-        while (!ct.IsCancellationRequested && _mqtt.IsConnected)
+        while (!ct.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
         {
-            var msg = await _mqtt.ReadMessageAsync(ct).ConfigureAwait(false);
-            if (msg is null) return null;
+            var cur = _mqtt;
+            var msg = await cur.ReadMessageAsync(ct).ConfigureAwait(false);
+            if (msg is null)
+            {
+                if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested)
+                    return null;
+                if (await TryTransparentReconnectAsync(cur, ct).ConfigureAwait(false))
+                    continue;
+                return null;
+            }
             if (!string.Equals(msg.Value.Topic, _rxTopic, StringComparison.Ordinal)) continue;
 
             var buf = msg.Value.Payload;
@@ -461,7 +568,8 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
 
     public ValueTask DisposeAsync()
     {
-        _txLock.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return ValueTask.CompletedTask;
         return _mqtt.DisposeAsync();
     }
 }

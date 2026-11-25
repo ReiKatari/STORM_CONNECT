@@ -63,6 +63,9 @@ public sealed class ClientSession : IAsyncDisposable
     private int _activeMonitorIndex;
     private bool _audioEnabled = true;
     private long _framesReceivedCount;
+    private long _packetsReceivedCount;
+    private string _lastVideoError = string.Empty;
+    private bool _loggedFirstUiRender;
 
     public SessionTelemetry Telemetry { get; } = new();
     public SessionPermissions GrantedPermissions { get; private set; } = new();
@@ -73,6 +76,21 @@ public sealed class ClientSession : IAsyncDisposable
     public bool IsConnected => _channel?.IsConnected == true;
     public bool IsAudioEnabled => _audioEnabled;
     public long FramesReceivedCount => Interlocked.Read(ref _framesReceivedCount);
+    public long PacketsReceivedCount => Interlocked.Read(ref _packetsReceivedCount);
+    public int ReconnectCount => (_channel as EncryptedTransportChannel)?.InnerReconnectCount ?? 0;
+    public string LastVideoError => _lastVideoError;
+    public string ActiveBrokerDisplay
+    {
+        get
+        {
+            if (_channel is EncryptedTransportChannel enc && !string.IsNullOrWhiteSpace(enc.InnerBrokerUrl) &&
+                Uri.TryCreate(enc.InnerBrokerUrl, UriKind.Absolute, out var u))
+            {
+                return $"{enc.Mode} ({u.Host})";
+            }
+            return Telemetry.Mode.ToString();
+        }
+    }
 
     public event Action<WriteableBitmap>? FrameUpdated;
     public event Action<int, int>? FrameDimensionsReceived;
@@ -309,7 +327,16 @@ public sealed class ClientSession : IAsyncDisposable
         if (GrantedPermissions.AllowAudio && _audioEnabled)
             _audio.StartPlayback();
 
-        Services.SessionLogger.Log("CLIENT", $"Authenticated to {RemoteHostName} via {_channel.Mode}");
+        if (_channel is EncryptedTransportChannel encCh)
+        {
+            encCh.InnerReconnected += cnt =>
+            {
+                Services.SessionLogger.Log("CLIENT", $"Transport reconnected (#{cnt}) on {ActiveBrokerDisplay}");
+                _ = SendSystemActionAsync(SystemActionKind.RequestKeyFrame);
+            };
+        }
+
+        Services.SessionLogger.Log("CLIENT", $"Authenticated to {RemoteHostName} via {ActiveBrokerDisplay}");
         StatusChanged?.Invoke(string.Format(Services.LocalizationService.T("StatusConnectedTo"), RemoteHostName));
         _ = Task.Run(() => ReceiveLoopAsync(token), token);
         _ = Task.Run(() => PingLoopAsync(token), token);
@@ -320,14 +347,19 @@ public sealed class ClientSession : IAsyncDisposable
     {
         try
         {
-            int[] delaysMs = [800, 1400, 2200];
-            foreach (int d in delaysMs)
+            int[] delaysMs = [900, 1800, 2500, 2500, 2500, 2500, 2500, 2500];
+            for (int i = 0; i < delaysMs.Length; i++)
             {
-                await Task.Delay(d, ct).ConfigureAwait(false);
+                await Task.Delay(delaysMs[i], ct).ConfigureAwait(false);
                 if (FramesReceivedCount == 0 && IsConnected)
+                {
+                    Services.SessionLogger.Log("CLIENT", $"RequestKeyFrame watchdog #{i + 1} (rxPkts={PacketsReceivedCount}, broker={ActiveBrokerDisplay})");
                     await SendSystemActionAsync(SystemActionKind.RequestKeyFrame).ConfigureAwait(false);
+                }
                 else
+                {
                     break;
+                }
             }
         }
         catch { }
@@ -563,6 +595,7 @@ public sealed class ClientSession : IAsyncDisposable
                     break;
                 }
 
+                Interlocked.Increment(ref _packetsReceivedCount);
                 Interlocked.Add(ref _bytesRxWindow, pkt.Payload.Length);
                 Telemetry.TotalBytesReceived += pkt.Payload.Length;
 
@@ -572,6 +605,7 @@ public sealed class ClientSession : IAsyncDisposable
                         var list = FrameCodec.DeserializeJson<List<MonitorInfo>>(pkt.Payload);
                         if (list is not null)
                         {
+                            Services.SessionLogger.Log("CLIENT", $"MonitorList received: count={list.Count}");
                             Monitors = list;
                             MonitorsUpdated?.Invoke(list);
                         }
@@ -580,8 +614,12 @@ public sealed class ClientSession : IAsyncDisposable
                     case PacketType.VideoFrameFull:
                     case PacketType.VideoFrameTiles:
                         var (w, h, rects) = TileDeltaEncoder.DeserializeVideoUpdate(pkt.Payload);
-                        Interlocked.Increment(ref _framesReceivedCount);
+                        long rxFrameNum = Interlocked.Increment(ref _framesReceivedCount);
                         Interlocked.Increment(ref _framesWindow);
+                        if (rxFrameNum <= 3)
+                        {
+                            Services.SessionLogger.Log("CLIENT", $"Received video frame #{rxFrameNum}: full={pkt.Type == PacketType.VideoFrameFull} {w}x{h} bytes={pkt.Payload.Length} rects={rects.Count}");
+                        }
                         if (pkt.Type == PacketType.VideoFrameFull) _lastTileSavings = 0;
                         else
                         {
@@ -692,6 +730,7 @@ public sealed class ClientSession : IAsyncDisposable
         }
         finally
         {
+            Services.SessionLogger.Log("CLIENT", $"Disconnected: {disconnectReason} | broker={ActiveBrokerDisplay} | rxPkts={PacketsReceivedCount} | frames={FramesReceivedCount} | reconnects={ReconnectCount}");
             foreach (var d in _downloads.Values)
             {
                 try { await d.Stream.DisposeAsync(); } catch { }
@@ -701,10 +740,9 @@ public sealed class ClientSession : IAsyncDisposable
         }
     }
 
-    public static WriteableBitmap DecodeSlicesIntoBitmap(WriteableBitmap? existing, int frameW, int frameH, List<VideoTileRect> rects)
+    private static (int X, int Y, int W, int H, int Stride, byte[] Bgra) DecodeRectToBgra(VideoTileRect r, Action<string>? onFallback = null)
     {
-        var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
-        foreach (var r in rects)
+        try
         {
             using var ms = new MemoryStream(r.JpegBytes, writable: false);
             var decoder = new JpegBitmapDecoder(ms, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
@@ -718,7 +756,36 @@ public sealed class ClientSession : IAsyncDisposable
             int stride = w * 4;
             var px = new byte[stride * h];
             src.CopyPixels(px, stride, 0);
-            decoded.Add((r.X, r.Y, w, h, stride, px));
+            return (r.X, r.Y, w, h, stride, px);
+        }
+        catch (Exception wicEx)
+        {
+            onFallback?.Invoke($"WIC->GDI+ fallback ({wicEx.Message})");
+            using var ms = new MemoryStream(r.JpegBytes, writable: false);
+            using var bmp = new Bitmap(ms);
+            int w = bmp.Width;
+            int h = bmp.Height;
+            var data = bmp.LockBits(new Rectangle(0, 0, w, h), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            try
+            {
+                int stride = Math.Abs(data.Stride);
+                var px = new byte[stride * h];
+                System.Runtime.InteropServices.Marshal.Copy(data.Scan0, px, 0, px.Length);
+                return (r.X, r.Y, w, h, stride, px);
+            }
+            finally
+            {
+                bmp.UnlockBits(data);
+            }
+        }
+    }
+
+    public static WriteableBitmap DecodeSlicesIntoBitmap(WriteableBitmap? existing, int frameW, int frameH, List<VideoTileRect> rects)
+    {
+        var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
+        foreach (var r in rects)
+        {
+            decoded.Add(DecodeRectToBgra(r));
         }
 
         if (existing is null || existing.PixelWidth != frameW || existing.PixelHeight != frameH)
@@ -743,23 +810,17 @@ public sealed class ClientSession : IAsyncDisposable
 
         try
         {
-            // Decode JPEG slices via native WPF WIC JpegBitmapDecoder off the UI thread
             var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
             foreach (var r in rects)
             {
-                using var ms = new MemoryStream(r.JpegBytes, writable: false);
-                var decoder = new JpegBitmapDecoder(ms, BitmapCreateOptions.None, BitmapCacheOption.OnLoad);
-                BitmapSource src = decoder.Frames[0];
-                if (src.Format != PixelFormats.Bgra32)
+                decoded.Add(DecodeRectToBgra(r, msg =>
                 {
-                    src = new FormatConvertedBitmap(src, PixelFormats.Bgra32, null, 0);
-                }
-                int w = src.PixelWidth;
-                int h = src.PixelHeight;
-                int stride = w * 4;
-                var px = new byte[stride * h];
-                src.CopyPixels(px, stride, 0);
-                decoded.Add((r.X, r.Y, w, h, stride, px));
+                    if (string.IsNullOrEmpty(_lastVideoError))
+                    {
+                        _lastVideoError = msg;
+                        Services.SessionLogger.Log("CLIENT", msg);
+                    }
+                }));
             }
 
             disp.BeginInvoke(() =>
@@ -781,17 +842,24 @@ public sealed class ClientSession : IAsyncDisposable
                             _bitmap.WritePixels(new Int32Rect(0, 0, copyW, copyH), d.Bgra, d.Stride, d.X, d.Y);
                         }
                     }
+                    if (!_loggedFirstUiRender)
+                    {
+                        _loggedFirstUiRender = true;
+                        Services.SessionLogger.Log("CLIENT", $"UI rendered frame #1: {frameW}x{frameH}");
+                    }
                     FrameUpdated?.Invoke(_bitmap);
                 }
                 catch (Exception ex)
                 {
+                    _lastVideoError = ex.Message;
                     Services.SessionLogger.Log("CLIENT", $"UI WritePixels error: {ex.Message}");
                 }
             });
         }
         catch (Exception ex)
         {
-            Services.SessionLogger.Log("CLIENT", $"JPEG WIC decode error: {ex.Message}");
+            _lastVideoError = ex.Message;
+            Services.SessionLogger.Log("CLIENT", $"Video decode error: {ex.Message}");
         }
     }
 

@@ -51,6 +51,7 @@ public sealed class HostServer : IAsyncDisposable
     private string _relayUrl = ProtocolConstants.DefaultRelayUrl;
     private readonly ConcurrentDictionary<string, ITransportChannel> _activeClients = new();
     private readonly ConcurrentDictionary<string, HostSessionContext> _activeContexts = new();
+    private readonly ConcurrentDictionary<string, Task> _activeSessionTasks = new();
     private readonly ConcurrentDictionary<string, DateTime> _seenMeshTokens = new();
     private int _connectedBrokerCount;
 
@@ -386,7 +387,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.2", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.3", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -498,13 +499,22 @@ public sealed class HostServer : IAsyncDisposable
             _activeClients[sessionId] = channel;
             _activeContexts[sessionId] = ctx;
             ClientConnected?.Invoke(ctx);
-            Services.SessionLogger.Log("HOST", $"Session started: {authReq.ClientName} ({authReq.ClientStormId}) via {channel.Mode}");
-            AuditLogEvent?.Invoke($"Session started: {authReq.ClientName} ({authReq.ClientStormId}) via {channel.Mode}");
+            string routeInfo = (channel as EncryptedTransportChannel)?.InnerBrokerUrl is { Length: > 0 } burl
+                ? $"{channel.Mode} ({burl})"
+                : channel.Mode.ToString();
+            Services.SessionLogger.Log("HOST", $"Session started ({sessionId}): {authReq.ClientName} ({authReq.ClientStormId}) via {routeInfo}");
+            AuditLogEvent?.Invoke($"Session started: {authReq.ClientName} ({authReq.ClientStormId}) via {routeInfo}");
 
             await channel.SendPacketAsync(PacketType.MonitorList, FrameCodec.SerializeJson(monitors), ct: ct).ConfigureAwait(false);
-            await RunHostSessionLoopAsync(channel, ctx, pendingRxTask, ct).ConfigureAwait(false);
+            var loopTask = RunHostSessionLoopAsync(channel, ctx, pendingRxTask, ct);
+            _activeSessionTasks[sessionId] = loopTask;
+            await loopTask.ConfigureAwait(false);
+            Services.SessionLogger.Log("HOST", $"Session closed ({sessionId}): {authReq.ClientName}");
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException)
+        {
+            Services.SessionLogger.Log("HOST", $"Session cancelled ({sessionId})");
+        }
         catch (Exception ex)
         {
             Services.SessionLogger.Log("HOST", $"Session ended ({sessionId}): {ex.Message}");
@@ -513,6 +523,7 @@ public sealed class HostServer : IAsyncDisposable
         finally
         {
             crypto?.Dispose();
+            _activeSessionTasks.TryRemove(sessionId, out _);
             _activeClients.TryRemove(sessionId, out _);
             _activeContexts.TryRemove(sessionId, out _);
             ClientDisconnected?.Invoke(sessionId);
@@ -526,15 +537,29 @@ public sealed class HostServer : IAsyncDisposable
         var ct = sessionCts.Token;
 
         int activeMonitor = 0;
-        bool forceKeyFrame = true;
+        int forceKeyFrame = 1;
+        int keyFrameRequestStreak = 0;
+        int framesSentCount = 0;
+        int pendingSharpUpgrade = 0;
+        long firstFrameSentTicks = 0;
+        long lastPeerRxTicks = DateTime.UtcNow.Ticks;
         int targetQuality = channel.Mode == ConnectionMode.WssRelay ? 55 : 75;
         using var capturer = new DxgiScreenCapturer();
         var encoder = new TileDeltaEncoder();
         using var audio = new AudioStreamer();
 
+        void OnTransportReconnected(int count)
+        {
+            Services.SessionLogger.Log("HOST", $"Transport reconnected (#{count}) for session {ctx.SessionId}");
+            Interlocked.Exchange(ref forceKeyFrame, 1);
+        }
+
+        if (channel is EncryptedTransportChannel encChannel)
+            encChannel.InnerReconnected += OnTransportReconnected;
+
         audio.AudioFrameCaptured += async pcm =>
         {
-            if (ctx.Permissions.AllowAudio && channel.IsConnected)
+            if (ctx.Permissions.AllowAudio && channel.IsConnected && !ct.IsCancellationRequested)
             {
                 try { await channel.SendPacketAsync(PacketType.AudioFrame, pcm, compress: true, ct).ConfigureAwait(false); } catch { }
             }
@@ -549,7 +574,6 @@ public sealed class HostServer : IAsyncDisposable
         var activeUploads = new ConcurrentDictionary<string, (FileStream Stream, long TotalBytes, long Received, string Path, string ExpectedSha)>();
 
         // Dedicated OS thread so SetThreadDesktop stays pinned to WinSta0\Default / UAC / Lock desktop
-        bool loggedFirstFrame = false;
         var videoDone = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var captureThread = new Thread(() =>
         {
@@ -561,15 +585,60 @@ public sealed class HostServer : IAsyncDisposable
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     try
                     {
+                        if (Volatile.Read(ref pendingSharpUpgrade) == 1 &&
+                            Volatile.Read(ref keyFrameRequestStreak) == 0 &&
+                            (DateTime.UtcNow.Ticks - Volatile.Read(ref firstFrameSentTicks)) >= TimeSpan.FromMilliseconds(400).Ticks)
+                        {
+                            Interlocked.Exchange(ref pendingSharpUpgrade, 0);
+                            Interlocked.Exchange(ref forceKeyFrame, 1);
+                        }
+
                         int mon = Volatile.Read(ref activeMonitor);
-                        int maxWidth = channel.Mode == ConnectionMode.WssRelay ? (mon == -1 ? 1440 : 1280) : 0;
+                        bool key = Interlocked.Exchange(ref forceKeyFrame, 0) != 0;
+                        int maxWidth = 0;
+                        int encodeQuality = targetQuality;
+                        int budgetBytes = 0;
+
+                        if (channel.Mode == ConnectionMode.WssRelay)
+                        {
+                            int streak = Volatile.Read(ref keyFrameRequestStreak);
+                            if (streak >= 3)
+                            {
+                                maxWidth = mon == -1 ? 800 : 640;
+                                encodeQuality = 24;
+                                budgetBytes = 8 * 1024;
+                            }
+                            else if (streak == 2)
+                            {
+                                maxWidth = mon == -1 ? 960 : 800;
+                                encodeQuality = 32;
+                                budgetBytes = 11 * 1024;
+                            }
+                            else if (streak == 1)
+                            {
+                                maxWidth = 960;
+                                encodeQuality = 42;
+                                budgetBytes = 22 * 1024;
+                            }
+                            else if (framesSentCount == 0)
+                            {
+                                // Instant first-frame preview <= 11 KB fits in a single 12 KB MQTT-WSS publish packet
+                                maxWidth = mon == -1 ? 960 : 800;
+                                encodeQuality = 38;
+                                budgetBytes = 11 * 1024;
+                            }
+                            else
+                            {
+                                maxWidth = mon == -1 ? 1440 : 1280;
+                                encodeQuality = targetQuality;
+                                budgetBytes = 42 * 1024;
+                            }
+                        }
+
                         var frame = capturer.Capture(mon, maxWidth);
                         if (frame is not null)
                         {
-                            bool key = forceKeyFrame;
-                            forceKeyFrame = false;
-                            int budgetBytes = channel.Mode == ConnectionMode.WssRelay ? 54 * 1024 : 0;
-                            var update = encoder.EncodeWithSizeBudget(frame, targetQuality, key, maxWidth, budgetBytes);
+                            var update = encoder.EncodeWithSizeBudget(frame, encodeQuality, key, maxWidth, budgetBytes);
                             if (update is not null)
                             {
                                 var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
@@ -580,10 +649,16 @@ public sealed class HostServer : IAsyncDisposable
                                     compress: false,
                                     ct).GetAwaiter().GetResult();
 
-                                if (!loggedFirstFrame)
+                                if (framesSentCount == 0)
                                 {
-                                    loggedFirstFrame = true;
-                                    Services.SessionLogger.Log("HOST", $"Sent video frame: full={update.IsFullFrame} {update.FrameWidth}x{update.FrameHeight} bytes={bytes.Length}");
+                                    Volatile.Write(ref firstFrameSentTicks, DateTime.UtcNow.Ticks);
+                                    if (channel.Mode == ConnectionMode.WssRelay)
+                                        Interlocked.Exchange(ref pendingSharpUpgrade, 1);
+                                }
+                                framesSentCount++;
+                                if (framesSentCount <= 3)
+                                {
+                                    Services.SessionLogger.Log("HOST", $"Sent video frame #{framesSentCount}: full={update.IsFullFrame} {update.FrameWidth}x{update.FrameHeight} bytes={bytes.Length}");
                                 }
                             }
                         }
@@ -593,11 +668,12 @@ public sealed class HostServer : IAsyncDisposable
                         }
                     }
                     catch (OperationCanceledException) { break; }
+                    catch (ObjectDisposedException) { break; }
                     catch (Exception ex)
                     {
+                        if (ct.IsCancellationRequested || !channel.IsConnected) break;
                         Services.SessionLogger.Log("HOST", $"Video loop error: {ex.Message}");
                         AuditLogEvent?.Invoke($"Video send loop error: {ex.Message}");
-                        if (!channel.IsConnected) break;
                     }
 
                     int elapsed = (int)sw.ElapsedMilliseconds;
@@ -623,6 +699,26 @@ public sealed class HostServer : IAsyncDisposable
         captureThread.Start();
         var videoTask = videoDone.Task;
 
+        // Peer inactivity watchdog so dead remote clients never leave zombie capture sessions
+        var watchdogTask = Task.Run(async () =>
+        {
+            try
+            {
+                while (!ct.IsCancellationRequested)
+                {
+                    await Task.Delay(5000, ct).ConfigureAwait(false);
+                    long idleTicks = DateTime.UtcNow.Ticks - Volatile.Read(ref lastPeerRxTicks);
+                    if (idleTicks > TimeSpan.FromSeconds(35).Ticks)
+                    {
+                        Services.SessionLogger.Log("HOST", $"Peer heartbeat timeout (35s) on session {ctx.SessionId}");
+                        sessionCts.Cancel();
+                        break;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        }, ct);
+
         try
         {
             while (!ct.IsCancellationRequested && channel.IsConnected)
@@ -638,6 +734,7 @@ public sealed class HostServer : IAsyncDisposable
                     pkt = await channel.ReceivePacketAsync(ct).ConfigureAwait(false);
                 }
                 if (pkt is null || pkt.Type == PacketType.Disconnect) break;
+                Volatile.Write(ref lastPeerRxTicks, DateTime.UtcNow.Ticks);
 
                 switch (pkt.Type)
                 {
@@ -654,11 +751,13 @@ public sealed class HostServer : IAsyncDisposable
                                     : Math.Clamp(reqQ, 25, 95);
                             }
                             encoder.Reset();
-                            forceKeyFrame = true;
+                            Interlocked.Exchange(ref keyFrameRequestStreak, 0);
+                            Interlocked.Exchange(ref forceKeyFrame, 1);
                         }
                         break;
 
                     case PacketType.InputMouse:
+                        Interlocked.Exchange(ref keyFrameRequestStreak, 0);
                         if (ctx.Permissions.AllowControl && pkt.Payload.Length >= 20)
                         {
                             double nx = BitConverter.ToDouble(pkt.Payload, 0);
@@ -671,6 +770,7 @@ public sealed class HostServer : IAsyncDisposable
                         break;
 
                     case PacketType.InputKeyboard:
+                        Interlocked.Exchange(ref keyFrameRequestStreak, 0);
                         if (ctx.Permissions.AllowControl && pkt.Payload.Length >= 8)
                         {
                             ushort vk = BitConverter.ToUInt16(pkt.Payload, 0);
@@ -688,7 +788,9 @@ public sealed class HostServer : IAsyncDisposable
                             var action = (SystemActionKind)pkt.Payload[0];
                             if (action == SystemActionKind.RequestKeyFrame)
                             {
-                                forceKeyFrame = true;
+                                int streak = Interlocked.Increment(ref keyFrameRequestStreak);
+                                Interlocked.Exchange(ref forceKeyFrame, 1);
+                                Services.SessionLogger.Log("HOST", $"Client requested keyframe (streak={streak}) on session {ctx.SessionId}");
                             }
                             else if (action == SystemActionKind.EnableAudio && ctx.Permissions.AllowAudio)
                             {
@@ -792,12 +894,15 @@ public sealed class HostServer : IAsyncDisposable
         }
         finally
         {
+            if (channel is EncryptedTransportChannel encCh)
+                encCh.InnerReconnected -= OnTransportReconnected;
             sessionCts.Cancel();
             foreach (var up in activeUploads.Values)
             {
                 try { await up.Stream.DisposeAsync(); } catch { }
             }
             try { await videoTask; } catch { }
+            try { await watchdogTask; } catch { }
         }
     }
 
@@ -892,6 +997,11 @@ public sealed class HostServer : IAsyncDisposable
         _relayCts?.Cancel();
         _cts?.Cancel();
         try { _listener?.Stop(); } catch { }
+        var runningTasks = _activeSessionTasks.Values.ToArray();
+        if (runningTasks.Length > 0)
+        {
+            try { await Task.WhenAny(Task.WhenAll(runningTasks), Task.Delay(1500)).ConfigureAwait(false); } catch { }
+        }
         foreach (var ch in _activeClients.Values)
             await ch.DisposeAsync().ConfigureAwait(false);
         _activeClients.Clear();

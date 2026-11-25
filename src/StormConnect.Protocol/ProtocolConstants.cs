@@ -19,8 +19,8 @@ public static class ProtocolConstants
 
     public static readonly string[] PublicMqttWssBrokers =
     [
-        "wss://broker.hivemq.com:8884/mqtt",
-        "wss://test.mosquitto.org:8081/mqtt"
+        "wss://test.mosquitto.org:8081/mqtt",
+        "wss://broker.hivemq.com:8884/mqtt"
     ];
 }
 

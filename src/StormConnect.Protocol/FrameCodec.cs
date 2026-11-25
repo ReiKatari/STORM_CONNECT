@@ -72,9 +72,10 @@ public sealed class TcpTransportChannel : ITransportChannel
     private readonly TcpClient _client;
     private readonly NetworkStream _stream;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _disposed;
 
     public ConnectionMode Mode { get; }
-    public bool IsConnected => _client.Connected;
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && _client.Connected;
 
     public TcpTransportChannel(TcpClient client, ConnectionMode mode)
     {
@@ -86,6 +87,8 @@ public sealed class TcpTransportChannel : ITransportChannel
 
     public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
         byte flags = 0;
         byte[] data;
         if (compress && payload.Length > 256)
@@ -102,6 +105,7 @@ public sealed class TcpTransportChannel : ITransportChannel
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref _disposed) != 0) return;
             await _stream.WriteAsync(raw, ct).ConfigureAwait(false);
             await _stream.FlushAsync(ct).ConfigureAwait(false);
         }
@@ -154,9 +158,10 @@ public sealed class TcpTransportChannel : ITransportChannel
 
     public ValueTask DisposeAsync()
     {
-        _sendLock.Dispose();
-        _stream.Dispose();
-        _client.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            return ValueTask.CompletedTask;
+        try { _stream.Dispose(); } catch { }
+        try { _client.Dispose(); } catch { }
         return ValueTask.CompletedTask;
     }
 }
@@ -165,9 +170,10 @@ public sealed class WebSocketTransportChannel : ITransportChannel
 {
     private readonly WebSocket _ws;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _disposed;
 
     public ConnectionMode Mode { get; }
-    public bool IsConnected => _ws.State == WebSocketState.Open;
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && _ws.State == WebSocketState.Open;
 
     public WebSocketTransportChannel(WebSocket ws, ConnectionMode mode = ConnectionMode.WssRelay)
     {
@@ -177,6 +183,8 @@ public sealed class WebSocketTransportChannel : ITransportChannel
 
     public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
         byte flags = 0;
         byte[] data;
         if (compress && payload.Length > 256)
@@ -193,6 +201,7 @@ public sealed class WebSocketTransportChannel : ITransportChannel
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref _disposed) != 0 || _ws.State != WebSocketState.Open) return;
             await _ws.SendAsync(raw, WebSocketMessageType.Binary, true, ct).ConfigureAwait(false);
         }
         finally
@@ -246,14 +255,14 @@ public sealed class WebSocketTransportChannel : ITransportChannel
 
     public async ValueTask DisposeAsync()
     {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         try
         {
             if (_ws.State == WebSocketState.Open)
                 await _ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None).ConfigureAwait(false);
         }
         catch { }
-        _sendLock.Dispose();
-        _ws.Dispose();
+        try { _ws.Dispose(); } catch { }
     }
 }
 
@@ -265,19 +274,34 @@ public sealed class EncryptedTransportChannel : ITransportChannel
     private readonly ITransportChannel _inner;
     private readonly CryptoSession _crypto;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
+    private int _disposed;
 
     public ConnectionMode Mode => _inner.Mode;
-    public bool IsConnected => _inner.IsConnected;
+    public bool IsConnected => Volatile.Read(ref _disposed) == 0 && _inner.IsConnected;
     public string? InnerCloseReason => (_inner as MqttPipeTransportChannel)?.CloseReason;
+    public string? InnerBrokerUrl => (_inner as MqttPipeTransportChannel)?.BrokerUrl;
+    public int InnerReconnectCount => (_inner as MqttPipeTransportChannel)?.ReconnectCount ?? 0;
+    public event Action<int>? InnerReconnected;
 
     public EncryptedTransportChannel(ITransportChannel inner, CryptoSession crypto)
     {
         _inner = inner;
         _crypto = crypto;
+        if (_inner is MqttPipeTransportChannel pipe)
+        {
+            pipe.Reconnected += count => InnerReconnected?.Invoke(count);
+        }
+    }
+
+    public void ForceAbortInnerForTest()
+    {
+        (_inner as MqttPipeTransportChannel)?.ForceAbortForTest();
     }
 
     public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
+        if (Volatile.Read(ref _disposed) != 0) return;
+
         // Pack [1B InnerType][1B InnerFlags][Payload] inside encrypted envelope
         byte innerFlags = 0;
         byte[] body;
@@ -299,6 +323,7 @@ public sealed class EncryptedTransportChannel : ITransportChannel
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            if (Volatile.Read(ref _disposed) != 0) return;
             var cipher = _crypto.Encrypt(plainEnvelope);
             await _inner.SendPacketAsync(type, cipher, compress: false, ct).ConfigureAwait(false);
         }
@@ -332,8 +357,8 @@ public sealed class EncryptedTransportChannel : ITransportChannel
 
     public async ValueTask DisposeAsync()
     {
-        _sendLock.Dispose();
-        _crypto.Dispose();
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         await _inner.DisposeAsync().ConfigureAwait(false);
+        _crypto.Dispose();
     }
 }

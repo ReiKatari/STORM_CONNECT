@@ -21,8 +21,8 @@ android {
         applicationId = "com.storm.connect"
         minSdk = 26
         targetSdk = 36
-        versionCode = 132
-        versionName = "1.3.2"
+        versionCode = 133
+        versionName = "1.3.3"
     }
 
     signingConfigs {

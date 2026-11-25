@@ -45,10 +45,18 @@ public sealed class TileDeltaEncoder
         if (EstimateWireSize(upd) <= maxPacketBytes)
             return upd;
 
-        int[] tryQualities = [Math.Min(jpegQuality, 42), 30, 22];
-        int[] tryWidths = [maxWidth > 0 ? maxWidth : frame.Width, Math.Min(maxWidth > 0 ? maxWidth : frame.Width, 960)];
+        int baseW = maxWidth > 0 ? maxWidth : frame.Width;
+        int[] tryWidths =
+        [
+            baseW,
+            Math.Min(baseW, 960),
+            Math.Min(baseW, 800),
+            Math.Min(baseW, 640),
+            Math.Min(baseW, 480)
+        ];
+        int[] tryQualities = [Math.Min(jpegQuality, 42), 32, 24, 18, 12];
 
-        foreach (int w in tryWidths)
+        foreach (int w in tryWidths.Distinct())
         {
             foreach (int q in tryQualities)
             {

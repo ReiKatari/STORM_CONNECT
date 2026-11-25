@@ -533,11 +533,17 @@ public partial class MainWindow : Window
         _lastAuthEnteredSecret = null;
 
         _clientSession = new ClientSession(s.StormId, _clipboardWatcher);
+        ImgRemoteScreen.Source = null;
+        TxtViewerDiag.Text = string.Empty;
+        TxtViewerDiag.Visibility = Visibility.Collapsed;
         _clientSession.StatusChanged += msg => Dispatcher.Invoke(() => TxtConnectStatus.Text = msg);
         _clientSession.FrameUpdated += bmp =>
         {
+            bool wasNull = ImgRemoteScreen.Source is null;
             ImgRemoteScreen.Source = bmp;
+            if (wasNull) ImgRemoteScreen.InvalidateVisual();
             ViewerEmptyState.Visibility = Visibility.Collapsed;
+            TxtViewerDiag.Visibility = Visibility.Collapsed;
         };
         _clientSession.MonitorsUpdated += mons => Dispatcher.Invoke(() =>
         {
@@ -562,6 +568,13 @@ public partial class MainWindow : Window
             BadgeSavings.Text = $"{LocalizationService.T("LabelDelta")}: {tel.TileSavingsPercent:0.#}%";
             TxtViewerHud.Text = $"{LocalizationService.LocalizeMode(tel.Mode)} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} {LocalizationService.T("LabelFps")} | {tel.RttMs} {LocalizationService.T("UnitMs")}";
             TelemetryChart.PushSample(tel.Fps, tel.BandwidthMbps);
+            if (_clientSession is not null && _clientSession.FramesReceivedCount == 0 && ViewerEmptyState.Visibility == Visibility.Visible)
+            {
+                string recPart = _clientSession.ReconnectCount > 0 ? $" | Reconnects: {_clientSession.ReconnectCount}" : string.Empty;
+                string errPart = !string.IsNullOrWhiteSpace(_clientSession.LastVideoError) ? $" | {_clientSession.LastVideoError}" : string.Empty;
+                TxtViewerDiag.Text = $"{_clientSession.ActiveBrokerDisplay} | RX: {_clientSession.PacketsReceivedCount} | RTT: {tel.RttMs} {LocalizationService.T("UnitMs")}{recPart}{errPart}";
+                TxtViewerDiag.Visibility = Visibility.Visible;
+            }
         });
         _clientSession.FileListReceived += fl => Dispatcher.Invoke(() => PopulateRemoteFiles(fl));
         _clientSession.FileTransferProgressed += prog => Dispatcher.Invoke(() =>
@@ -578,12 +591,14 @@ public partial class MainWindow : Window
         _clientSession.Disconnected += reason => Dispatcher.Invoke(() =>
         {
             _currentMonitors = [];
+            ImgRemoteScreen.Source = null;
             TxtConnectStatus.Text = $"{LocalizationService.T("StatusDisconnected")}: {reason}";
             TxtViewerHud.Text = LocalizationService.T("ViewerIdle");
             CmbMonitorSelect.ItemsSource = new[] { LocalizationService.T("MonitorNone") };
             CmbMonitorSelect.SelectedIndex = 0;
             RebuildMonitorPills();
-            TxtNoActiveSession.Text = LocalizationService.T("NoActiveSession");
+            TxtNoActiveSession.Text = $"{LocalizationService.T("StatusDisconnected")}: {reason}";
+            TxtViewerDiag.Visibility = Visibility.Collapsed;
             ViewerEmptyState.Visibility = Visibility.Visible;
         });
 
@@ -1117,6 +1132,9 @@ public partial class MainWindow : Window
             await _clientSession.DisposeAsync();
             _clientSession = null;
         }
+        ImgRemoteScreen.Source = null;
+        TxtNoActiveSession.Text = LocalizationService.T("NoActiveSession");
+        TxtViewerDiag.Visibility = Visibility.Collapsed;
         ViewerEmptyState.Visibility = Visibility.Visible;
         NavDashboard.IsChecked = true;
     }

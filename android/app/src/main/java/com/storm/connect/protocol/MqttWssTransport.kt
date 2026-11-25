@@ -194,8 +194,8 @@ class MqttWssClient {
 
     companion object {
         val PUBLIC_BROKERS = listOf(
-            "wss://broker.hivemq.com:8884/mqtt",
-            "wss://test.mosquitto.org:8081/mqtt"
+            "wss://test.mosquitto.org:8081/mqtt",
+            "wss://broker.hivemq.com:8884/mqtt"
         )
     }
 }
@@ -223,11 +223,11 @@ class MqttPipeTransportChannel(
         } else payload
         val rawFrame = FrameCodec.encodePlain(type, data, flags)
         val msgId = nextMsgId++
-        val maxBody = 60 * 1024
+        val maxBody = 12 * 1024
         val partCount = maxOf(1, (rawFrame.size + maxBody - 1) / maxBody)
 
         for (p in 0 until partCount) {
-            if (p > 0) kotlinx.coroutines.delay(3)
+            if (p > 0) kotlinx.coroutines.delay(6)
             val off = p * maxBody
             val len = minOf(maxBody, rawFrame.size - off)
             val chunk = ByteArray(12 + len)
