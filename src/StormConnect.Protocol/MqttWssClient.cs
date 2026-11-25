@@ -324,7 +324,8 @@ public sealed class MqttWssClient : IAsyncDisposable
 }
 
 /// <summary>
-/// Full ITransportChannel over MQTT-over-WSS with 12 KB DPI-safe chunking and transparent auto-reconnect.
+/// Full ITransportChannel over MQTT-over-WSS with 12 KB DPI-safe chunking,
+/// packet deduplication, and proactive 14s Make-Before-Break socket rotation.
 /// </summary>
 public sealed class MqttPipeTransportChannel : ITransportChannel
 {
@@ -334,12 +335,19 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
     private readonly string _sessionToken;
     private readonly bool _isInitiator;
     private readonly string _clientIdPrefix;
+    private readonly bool _enableProactiveRotation;
     private readonly string _txTopic;
     private readonly string _rxTopic;
     private readonly SemaphoreSlim _txLock = new(1, 1);
     private readonly SemaphoreSlim _reconnectLock = new(1, 1);
+    private readonly CancellationTokenSource _lifecycleCts = new();
+    private readonly object _dedupLock = new();
+    private readonly HashSet<long> _recentChunkKeys = new();
+    private readonly Queue<long> _recentChunkQueue = new();
+    private DateTime _socketConnectedUtc = DateTime.UtcNow;
     private int _nextMsgId;
     private int _reconnectCount;
+    private int _rotationStarted;
     private int _disposed;
     private volatile bool _reconnecting;
     private readonly ConcurrentDictionary<int, (int TotalLen, int ReceivedParts, byte[][] Parts, DateTime CreatedUtc)> _assemblies = new();
@@ -351,20 +359,105 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
     public string? CloseReason => _mqtt.CloseReason;
     public event Action<int>? Reconnected;
 
-    public MqttPipeTransportChannel(MqttWssClient mqtt, string sessionToken, bool isInitiator, string? clientIdPrefix = null)
+    public MqttPipeTransportChannel(MqttWssClient mqtt, string sessionToken, bool isInitiator, string? clientIdPrefix = null, bool enableProactiveRotation = true)
     {
         _mqtt = mqtt;
         _brokerUrl = mqtt.BrokerUrl;
         _sessionToken = sessionToken;
         _isInitiator = isInitiator;
+        _enableProactiveRotation = enableProactiveRotation;
         _clientIdPrefix = string.IsNullOrWhiteSpace(clientIdPrefix) ? (isInitiator ? "sc_c" : "sc_h") : clientIdPrefix;
         _txTopic = isInitiator ? $"sc/v1/p/{sessionToken}/c2h" : $"sc/v1/p/{sessionToken}/h2c";
         _rxTopic = isInitiator ? $"sc/v1/p/{sessionToken}/h2c" : $"sc/v1/p/{sessionToken}/c2h";
     }
 
-    public Task SubscribeRxAsync(CancellationToken ct = default) => _mqtt.SubscribeAsync(_rxTopic, ct);
+    public Task SubscribeRxAsync(CancellationToken ct = default)
+    {
+        EnsureRotationLoopStarted();
+        return _mqtt.SubscribeAsync(_rxTopic, ct);
+    }
 
     public void ForceAbortForTest() => _mqtt.ForceAbortForTest();
+
+    private void EnsureRotationLoopStarted()
+    {
+        if (!_enableProactiveRotation || string.IsNullOrWhiteSpace(_brokerUrl) || Volatile.Read(ref _disposed) != 0)
+            return;
+        if (Interlocked.Exchange(ref _rotationStarted, 1) != 0)
+            return;
+        _ = Task.Run(() => ProactiveRotationLoopAsync(_lifecycleCts.Token));
+    }
+
+    private async Task ProactiveRotationLoopAsync(CancellationToken ct)
+    {
+        try
+        {
+            while (!ct.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
+            {
+                await Task.Delay(2000, ct).ConfigureAwait(false);
+                if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested) break;
+                if ((DateTime.UtcNow - _socketConnectedUtc).TotalSeconds < 14.0) continue;
+
+                var old = _mqtt;
+                await _reconnectLock.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested) break;
+                    if (!ReferenceEquals(_mqtt, old) || (DateTime.UtcNow - _socketConnectedUtc).TotalSeconds < 14.0)
+                        continue;
+
+                    var fresh = new MqttWssClient();
+                    try
+                    {
+                        using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                        attemptCts.CancelAfter(TimeSpan.FromSeconds(5));
+                        string cid = $"{_clientIdPrefix}_p_{Guid.NewGuid().ToString("N")[..6]}";
+                        await fresh.ConnectAsync(_brokerUrl, cid, attemptCts.Token).ConfigureAwait(false);
+                        await fresh.SubscribeAsync(_rxTopic, attemptCts.Token).ConfigureAwait(false);
+
+                        _mqtt = fresh;
+                        _socketConnectedUtc = DateTime.UtcNow;
+                        int cnt = Interlocked.Increment(ref _reconnectCount);
+                        Reconnected?.Invoke(cnt);
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                await Task.Delay(350).ConfigureAwait(false);
+                                await old.DisposeAsync().ConfigureAwait(false);
+                            }
+                            catch { }
+                        });
+                    }
+                    catch
+                    {
+                        try { await fresh.DisposeAsync().ConfigureAwait(false); } catch { }
+                    }
+                }
+                finally
+                {
+                    _reconnectLock.Release();
+                }
+            }
+        }
+        catch (OperationCanceledException) { }
+    }
+
+    private bool IsDuplicateChunk(int msgId, ushort partIdx)
+    {
+        long key = ((long)msgId << 16) | partIdx;
+        lock (_dedupLock)
+        {
+            if (!_recentChunkKeys.Add(key))
+                return true;
+            _recentChunkQueue.Enqueue(key);
+            while (_recentChunkQueue.Count > 512)
+            {
+                _recentChunkKeys.Remove(_recentChunkQueue.Dequeue());
+            }
+            return false;
+        }
+    }
 
     private async Task<bool> TryTransparentReconnectAsync(MqttWssClient failedClient, CancellationToken ct)
     {
@@ -381,7 +474,7 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
                 return true;
 
             _reconnecting = true;
-            int[] backoffsMs = [200, 400, 700, 1000, 1500, 2000];
+            int[] backoffsMs = [150, 300, 600, 1000, 1500, 2000];
             foreach (int delayMs in backoffsMs)
             {
                 if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested)
@@ -397,6 +490,7 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
                     await fresh.SubscribeAsync(_rxTopic, attemptCts.Token).ConfigureAwait(false);
 
                     _mqtt = fresh;
+                    _socketConnectedUtc = DateTime.UtcNow;
                     int cnt = Interlocked.Increment(ref _reconnectCount);
                     _ = Task.Run(async () => { try { await failedClient.DisposeAsync().ConfigureAwait(false); } catch { } });
                     Reconnected?.Invoke(cnt);
@@ -420,6 +514,7 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
     public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
         if (Volatile.Read(ref _disposed) != 0) return;
+        EnsureRotationLoopStarted();
 
         byte flags = 0;
         byte[] data;
@@ -453,7 +548,7 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
                     for (int p = 0; p < partCount; p++)
                     {
                         if (p > 0)
-                            await Task.Delay(6, ct).ConfigureAwait(false);
+                            await Task.Delay(4, ct).ConfigureAwait(false);
 
                         int off = p * MaxChunkBody;
                         int len = Math.Min(MaxChunkBody, rawFrame.Length - off);
@@ -483,6 +578,7 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
 
     public async Task<SconPacket?> ReceivePacketAsync(CancellationToken ct = default)
     {
+        EnsureRotationLoopStarted();
         while (!ct.IsCancellationRequested && Volatile.Read(ref _disposed) == 0)
         {
             var cur = _mqtt;
@@ -491,6 +587,8 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
             {
                 if (Volatile.Read(ref _disposed) != 0 || ct.IsCancellationRequested)
                     return null;
+                if (!ReferenceEquals(_mqtt, cur) && _mqtt.IsConnected)
+                    continue;
                 if (await TryTransparentReconnectAsync(cur, ct).ConfigureAwait(false))
                     continue;
                 return null;
@@ -506,6 +604,8 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
             int totalLen = BinaryPrimitives.ReadInt32LittleEndian(buf.AsSpan(8, 4));
 
             if (partCount == 0 || partIdx >= partCount || totalLen <= 0 || totalLen > ProtocolConstants.MaxPacketPayloadBytes + FrameCodec.WireHeaderBytes)
+                continue;
+            if (IsDuplicateChunk(msgId, partIdx))
                 continue;
 
             byte[]? fullRaw = null;
@@ -570,6 +670,8 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
             return ValueTask.CompletedTask;
+        try { _lifecycleCts.Cancel(); } catch { }
+        try { _lifecycleCts.Dispose(); } catch { }
         return _mqtt.DisposeAsync();
     }
 }

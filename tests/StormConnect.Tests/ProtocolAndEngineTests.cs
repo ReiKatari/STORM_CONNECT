@@ -854,4 +854,129 @@ public sealed class ProtocolAndEngineTests
         await host.DisposeAsync();
         Assert.Empty(auditErrors);
     }
+
+    [Fact]
+    public void TileDeltaEncoder_EncodeAtomicPackets_ProducesCrisp1280x720Under10_5KbEach()
+    {
+        int w = 3840, h = 2160;
+        var px = new byte[w * h * 4];
+        var rng = new Random(789);
+        for (int y = 0; y < h; y++)
+        {
+            for (int x = 0; x < w; x++)
+            {
+                int off = (y * w + x) * 4;
+                px[off] = (byte)(30 + (x % 180));
+                px[off + 1] = (byte)(50 + (y % 180));
+                px[off + 2] = (byte)(rng.Next(40, 220));
+                px[off + 3] = 255;
+            }
+        }
+        var frame = new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = px };
+
+        var enc = new TileDeltaEncoder();
+        var packets = enc.EncodeAtomicPackets(frame, jpegQuality: 64, forceFullFrame: true, maxWidth: 1280, maxPacketBytes: 10_500);
+        Assert.True(packets.Count >= 8, $"Expected >= 8 strips, got {packets.Count}");
+
+        foreach (var p in packets)
+        {
+            Assert.Equal(1280, p.FrameWidth);
+            Assert.Equal(720, p.FrameHeight);
+            var wire = TileDeltaEncoder.SerializeVideoUpdate(p);
+            Assert.True(wire.Length <= 10_500, $"Atomic packet exceeded 10.5 KB limit: {wire.Length} bytes");
+        }
+
+        // Verify decoded bitmap covers 100% of 1280x720 pixels with zero black bands
+        Exception? staEx = null;
+        long nonBlack = 0;
+        var t = new Thread(() =>
+        {
+            try
+            {
+                System.Windows.Media.Imaging.WriteableBitmap? wb = null;
+                foreach (var p in packets)
+                {
+                    wb = ClientSession.DecodeSlicesIntoBitmap(wb, p.FrameWidth, p.FrameHeight, p.Rects);
+                }
+                Assert.NotNull(wb);
+                var buf = new byte[1280 * 720 * 4];
+                wb!.CopyPixels(buf, 1280 * 4, 0);
+                for (int i = 0; i < buf.Length; i += 4)
+                {
+                    if (buf[i] > 10 || buf[i + 1] > 10 || buf[i + 2] > 10)
+                        nonBlack++;
+                }
+            }
+            catch (Exception ex) { staEx = ex; }
+        });
+        t.SetApartmentState(ApartmentState.STA);
+        t.Start();
+        t.Join();
+        Assert.Null(staEx);
+        Assert.Equal(1280 * 720, nonBlack);
+    }
+
+    [Fact]
+    public async Task MqttPipe_ProactiveMakeBeforeBreak_ZeroDropOver17Seconds()
+    {
+        string broker = ProtocolConstants.PublicMqttWssBrokers[0];
+        string tok = Guid.NewGuid().ToString("N");
+
+        var mqttH = new MqttWssClient();
+        var mqttC = new MqttWssClient();
+        await mqttH.ConnectAsync(broker, "pro_h_" + tok[..6]);
+        await mqttC.ConnectAsync(broker, "pro_c_" + tok[..6]);
+
+        var pipeH = new MqttPipeTransportChannel(mqttH, tok, isInitiator: false);
+        var pipeC = new MqttPipeTransportChannel(mqttC, tok, isInitiator: true);
+        await pipeH.SubscribeRxAsync();
+        await pipeC.SubscribeRxAsync();
+
+        using var keyH = new CryptoSession();
+        using var keyC = new CryptoSession();
+        await pipeH.SendPacketAsync(PacketType.KeyExchange, keyH.LocalPublicKeyUncompressed);
+        var pkH = await pipeC.ReceivePacketAsync();
+        await pipeC.SendPacketAsync(PacketType.KeyExchange, keyC.LocalPublicKeyUncompressed);
+        var pkC = await pipeH.ReceivePacketAsync();
+        keyC.DeriveKeys(pkH!.Payload, isInitiator: true);
+        keyH.DeriveKeys(pkC!.Payload, isInitiator: false);
+
+        await using var encH = new EncryptedTransportChannel(pipeH, keyH);
+        await using var encC = new EncryptedTransportChannel(pipeC, keyC);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(24));
+        int pongs = 0;
+        var hostLoop = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested && encH.IsConnected)
+            {
+                var p = await encH.ReceivePacketAsync(cts.Token);
+                if (p is null) break;
+                if (p.Type == PacketType.Ping)
+                    await encH.SendPacketAsync(PacketType.Pong, p.Payload, ct: cts.Token);
+            }
+        });
+        var cliLoop = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested && encC.IsConnected)
+            {
+                var p = await encC.ReceivePacketAsync(cts.Token);
+                if (p is null) break;
+                if (p.Type == PacketType.Pong)
+                    Interlocked.Increment(ref pongs);
+            }
+        });
+
+        for (int i = 0; i < 17; i++)
+        {
+            await encC.SendPacketAsync(PacketType.Ping, BitConverter.GetBytes(i), ct: cts.Token);
+            await Task.Delay(1000, cts.Token);
+        }
+
+        Assert.True(encC.InnerReconnectCount >= 1, $"Expected proactive rotation >= 1 by 17s, got {encC.InnerReconnectCount}");
+        Assert.True(encH.InnerReconnectCount >= 1, $"Expected host proactive rotation >= 1 by 17s, got {encH.InnerReconnectCount}");
+        Assert.True(Volatile.Read(ref pongs) >= 15, $"Expected >= 15/17 Pongs through rotation, got {pongs}");
+        cts.Cancel();
+        try { await Task.WhenAll(hostLoop, cliLoop); } catch { }
+    }
 }

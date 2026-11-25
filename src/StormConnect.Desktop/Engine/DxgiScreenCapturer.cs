@@ -88,7 +88,9 @@ public sealed class DxgiScreenCapturer : IDisposable
 
             if (monitorIndex >= 0 && !_dxgiDisabled)
             {
-                pixels = TryCaptureDxgi(monitorIndex, bounds);
+                var dx = TryCaptureDxgi(monitorIndex, bounds, maxWidth);
+                if (dx is not null)
+                    (pixels, outW, outH) = dx.Value;
             }
 
             if (pixels is null)
@@ -117,10 +119,8 @@ public sealed class DxgiScreenCapturer : IDisposable
         }
     }
 
-    private byte[]? TryCaptureDxgi(int monitorIndex, Rectangle bounds)
+    private (byte[] Pixels, int Width, int Height)? TryCaptureDxgi(int monitorIndex, Rectangle bounds, int maxWidth)
     {
-        int expectedW = bounds.Width;
-        int expectedH = bounds.Height;
         try
         {
             if (_dupMonitorIndex != monitorIndex || _duplication == IntPtr.Zero)
@@ -177,13 +177,24 @@ public sealed class DxgiScreenCapturer : IDisposable
 
                     try
                     {
-                        int rowBytes = _dupWidth * 4;
-                        var buf = new byte[rowBytes * _dupHeight];
-                        for (int y = 0; y < _dupHeight; y++)
+                        bool scaled = maxWidth > 0 && _dupWidth > maxWidth;
+                        int outW = scaled ? Math.Max(64, maxWidth & ~1) : _dupWidth;
+                        int outH = scaled ? Math.Max(64, ((int)Math.Round(_dupHeight * ((double)outW / _dupWidth))) & ~1) : _dupHeight;
+                        int rowBytes = outW * 4;
+                        var buf = GC.AllocateUninitializedArray<byte>(rowBytes * outH);
+
+                        if (!scaled)
                         {
-                            Marshal.Copy(IntPtr.Add(mapped.pData, y * mapped.RowPitch), buf, y * rowBytes, rowBytes);
+                            for (int y = 0; y < _dupHeight; y++)
+                            {
+                                Marshal.Copy(IntPtr.Add(mapped.pData, y * mapped.RowPitch), buf, y * rowBytes, rowBytes);
+                            }
                         }
-                        return buf;
+                        else
+                        {
+                            DownscalePointerToBgra(mapped.pData, mapped.RowPitch, _dupWidth, _dupHeight, buf, outW, outH);
+                        }
+                        return (buf, outW, outH);
                     }
                     finally
                     {
@@ -212,6 +223,44 @@ public sealed class DxgiScreenCapturer : IDisposable
             ReleaseDxgi();
             _dxgiDisabled = true;
             return null;
+        }
+    }
+
+    private static unsafe void DownscalePointerToBgra(IntPtr srcPtr, int srcPitch, int srcW, int srcH, byte[] dst, int dstW, int dstH)
+    {
+        byte* srcBase = (byte*)srcPtr;
+        bool boxFilter = srcW >= dstW * 2 && srcH >= dstH * 2;
+        fixed (byte* dstBase = dst)
+        {
+            for (int y = 0; y < dstH; y++)
+            {
+                int sy0 = (int)((long)y * srcH / dstH);
+                int sy1 = boxFilter && sy0 + 1 < srcH ? sy0 + 1 : sy0;
+                byte* row0 = srcBase + sy0 * srcPitch;
+                byte* row1 = srcBase + sy1 * srcPitch;
+                uint* dstRow = (uint*)(dstBase + y * dstW * 4);
+
+                for (int x = 0; x < dstW; x++)
+                {
+                    int sx0 = (int)((long)x * srcW / dstW);
+                    if (!boxFilter)
+                    {
+                        dstRow[x] = *(uint*)(row0 + sx0 * 4);
+                    }
+                    else
+                    {
+                        int sx1 = sx0 + 1 < srcW ? sx0 + 1 : sx0;
+                        byte* p00 = row0 + sx0 * 4;
+                        byte* p01 = row0 + sx1 * 4;
+                        byte* p10 = row1 + sx0 * 4;
+                        byte* p11 = row1 + sx1 * 4;
+                        uint b = (uint)(p00[0] + p01[0] + p10[0] + p11[0]) >> 2;
+                        uint g = (uint)(p00[1] + p01[1] + p10[1] + p11[1]) >> 2;
+                        uint r = (uint)(p00[2] + p01[2] + p10[2] + p11[2]) >> 2;
+                        dstRow[x] = b | (g << 8) | (r << 16) | 0xFF000000u;
+                    }
+                }
+            }
         }
     }
 

@@ -387,7 +387,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.3", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.4", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -538,20 +538,16 @@ public sealed class HostServer : IAsyncDisposable
 
         int activeMonitor = 0;
         int forceKeyFrame = 1;
-        int keyFrameRequestStreak = 0;
         int framesSentCount = 0;
-        int pendingSharpUpgrade = 0;
-        long firstFrameSentTicks = 0;
         long lastPeerRxTicks = DateTime.UtcNow.Ticks;
-        int targetQuality = channel.Mode == ConnectionMode.WssRelay ? 55 : 75;
+        int targetQuality = 75;
         using var capturer = new DxgiScreenCapturer();
         var encoder = new TileDeltaEncoder();
         using var audio = new AudioStreamer();
 
         void OnTransportReconnected(int count)
         {
-            Services.SessionLogger.Log("HOST", $"Transport reconnected (#{count}) for session {ctx.SessionId}");
-            Interlocked.Exchange(ref forceKeyFrame, 1);
+            Services.SessionLogger.Log("HOST", $"Proactive/auto transport rotation (#{count}) for session {ctx.SessionId}");
         }
 
         if (channel is EncryptedTransportChannel encChannel)
@@ -585,80 +581,84 @@ public sealed class HostServer : IAsyncDisposable
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     try
                     {
-                        if (Volatile.Read(ref pendingSharpUpgrade) == 1 &&
-                            Volatile.Read(ref keyFrameRequestStreak) == 0 &&
-                            (DateTime.UtcNow.Ticks - Volatile.Read(ref firstFrameSentTicks)) >= TimeSpan.FromMilliseconds(400).Ticks)
-                        {
-                            Interlocked.Exchange(ref pendingSharpUpgrade, 0);
-                            Interlocked.Exchange(ref forceKeyFrame, 1);
-                        }
-
                         int mon = Volatile.Read(ref activeMonitor);
                         bool key = Interlocked.Exchange(ref forceKeyFrame, 0) != 0;
+                        int qSnapshot = Volatile.Read(ref targetQuality);
                         int maxWidth = 0;
-                        int encodeQuality = targetQuality;
-                        int budgetBytes = 0;
+                        int encodeQuality = qSnapshot;
 
                         if (channel.Mode == ConnectionMode.WssRelay)
                         {
-                            int streak = Volatile.Read(ref keyFrameRequestStreak);
-                            if (streak >= 3)
+                            if (qSnapshot >= 85)
                             {
-                                maxWidth = mon == -1 ? 800 : 640;
-                                encodeQuality = 24;
-                                budgetBytes = 8 * 1024;
+                                maxWidth = mon == -1 ? 1920 : 1600;
+                                encodeQuality = 72;
                             }
-                            else if (streak == 2)
+                            else if (qSnapshot >= 65)
                             {
-                                maxWidth = mon == -1 ? 960 : 800;
-                                encodeQuality = 32;
-                                budgetBytes = 11 * 1024;
+                                maxWidth = mon == -1 ? 1600 : 1280;
+                                encodeQuality = 64;
                             }
-                            else if (streak == 1)
+                            else if (qSnapshot >= 45)
                             {
-                                maxWidth = 960;
-                                encodeQuality = 42;
-                                budgetBytes = 22 * 1024;
-                            }
-                            else if (framesSentCount == 0)
-                            {
-                                // Instant first-frame preview <= 11 KB fits in a single 12 KB MQTT-WSS publish packet
-                                maxWidth = mon == -1 ? 960 : 800;
-                                encodeQuality = 38;
-                                budgetBytes = 11 * 1024;
+                                maxWidth = 1280;
+                                encodeQuality = 52;
                             }
                             else
                             {
-                                maxWidth = mon == -1 ? 1440 : 1280;
-                                encodeQuality = targetQuality;
-                                budgetBytes = 42 * 1024;
+                                maxWidth = mon == -1 ? 1280 : 960;
+                                encodeQuality = 42;
                             }
                         }
 
                         var frame = capturer.Capture(mon, maxWidth);
                         if (frame is not null)
                         {
-                            var update = encoder.EncodeWithSizeBudget(frame, encodeQuality, key, maxWidth, budgetBytes);
-                            if (update is not null)
+                            if (channel.Mode == ConnectionMode.WssRelay)
                             {
-                                var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
-                                lastBytesSent = bytes.Length;
-                                channel.SendPacketAsync(
-                                    update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles,
-                                    bytes,
-                                    compress: false,
-                                    ct).GetAwaiter().GetResult();
+                                var atomicPackets = encoder.EncodeAtomicPackets(frame, encodeQuality, key, maxWidth, maxPacketBytes: 10_500);
+                                int totalBytes = 0;
+                                for (int i = 0; i < atomicPackets.Count; i++)
+                                {
+                                    if (ct.IsCancellationRequested || !channel.IsConnected) break;
+                                    var upd = atomicPackets[i];
+                                    var bytes = TileDeltaEncoder.SerializeVideoUpdate(upd);
+                                    totalBytes += bytes.Length;
+                                    channel.SendPacketAsync(PacketType.VideoFrameTiles, bytes, compress: false, ct).GetAwaiter().GetResult();
 
-                                if (framesSentCount == 0)
-                                {
-                                    Volatile.Write(ref firstFrameSentTicks, DateTime.UtcNow.Ticks);
-                                    if (channel.Mode == ConnectionMode.WssRelay)
-                                        Interlocked.Exchange(ref pendingSharpUpgrade, 1);
+                                    if (atomicPackets.Count > 3 && i + 1 < atomicPackets.Count)
+                                    {
+                                        if (ct.WaitHandle.WaitOne(12)) break;
+                                    }
                                 }
-                                framesSentCount++;
-                                if (framesSentCount <= 3)
+                                if (atomicPackets.Count > 0)
                                 {
-                                    Services.SessionLogger.Log("HOST", $"Sent video frame #{framesSentCount}: full={update.IsFullFrame} {update.FrameWidth}x{update.FrameHeight} bytes={bytes.Length}");
+                                    lastBytesSent = totalBytes;
+                                    framesSentCount++;
+                                    if (framesSentCount <= 3 || key)
+                                    {
+                                        Services.SessionLogger.Log("HOST", $"Sent atomic frame #{framesSentCount}: strips={atomicPackets.Count} {atomicPackets[0].FrameWidth}x{atomicPackets[0].FrameHeight} totalBytes={totalBytes}");
+                                    }
+                                }
+                            }
+                            else
+                            {
+                                var update = encoder.Encode(frame, encodeQuality, key, maxWidth);
+                                if (update is not null)
+                                {
+                                    var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
+                                    lastBytesSent = bytes.Length;
+                                    channel.SendPacketAsync(
+                                        update.IsFullFrame ? PacketType.VideoFrameFull : PacketType.VideoFrameTiles,
+                                        bytes,
+                                        compress: false,
+                                        ct).GetAwaiter().GetResult();
+
+                                    framesSentCount++;
+                                    if (framesSentCount <= 3)
+                                    {
+                                        Services.SessionLogger.Log("HOST", $"Sent video frame #{framesSentCount}: full={update.IsFullFrame} {update.FrameWidth}x{update.FrameHeight} bytes={bytes.Length}");
+                                    }
                                 }
                             }
                         }
@@ -678,7 +678,7 @@ public sealed class HostServer : IAsyncDisposable
 
                     int elapsed = (int)sw.ElapsedMilliseconds;
                     int targetInterval = channel.Mode == ConnectionMode.WssRelay
-                        ? Math.Max(90, Math.Min(350, lastBytesSent / 320))
+                        ? Math.Clamp(lastBytesSent / 550, 35, 110)
                         : 20;
                     lastBytesSent = 0;
                     if (elapsed < targetInterval)
@@ -746,18 +746,14 @@ public sealed class HostServer : IAsyncDisposable
                             if (pkt.Payload.Length >= 8)
                             {
                                 int reqQ = BitConverter.ToInt32(pkt.Payload, 4);
-                                targetQuality = channel.Mode == ConnectionMode.WssRelay
-                                    ? Math.Clamp(reqQ, 25, 75)
-                                    : Math.Clamp(reqQ, 25, 95);
+                                Interlocked.Exchange(ref targetQuality, Math.Clamp(reqQ, 25, 95));
                             }
                             encoder.Reset();
-                            Interlocked.Exchange(ref keyFrameRequestStreak, 0);
                             Interlocked.Exchange(ref forceKeyFrame, 1);
                         }
                         break;
 
                     case PacketType.InputMouse:
-                        Interlocked.Exchange(ref keyFrameRequestStreak, 0);
                         if (ctx.Permissions.AllowControl && pkt.Payload.Length >= 20)
                         {
                             double nx = BitConverter.ToDouble(pkt.Payload, 0);
@@ -770,7 +766,6 @@ public sealed class HostServer : IAsyncDisposable
                         break;
 
                     case PacketType.InputKeyboard:
-                        Interlocked.Exchange(ref keyFrameRequestStreak, 0);
                         if (ctx.Permissions.AllowControl && pkt.Payload.Length >= 8)
                         {
                             ushort vk = BitConverter.ToUInt16(pkt.Payload, 0);
@@ -788,9 +783,9 @@ public sealed class HostServer : IAsyncDisposable
                             var action = (SystemActionKind)pkt.Payload[0];
                             if (action == SystemActionKind.RequestKeyFrame)
                             {
-                                int streak = Interlocked.Increment(ref keyFrameRequestStreak);
+                                encoder.Reset();
                                 Interlocked.Exchange(ref forceKeyFrame, 1);
-                                Services.SessionLogger.Log("HOST", $"Client requested keyframe (streak={streak}) on session {ctx.SessionId}");
+                                Services.SessionLogger.Log("HOST", $"Client requested crisp keyframe on session {ctx.SessionId}");
                             }
                             else if (action == SystemActionKind.EnableAudio && ctx.Permissions.AllowAudio)
                             {

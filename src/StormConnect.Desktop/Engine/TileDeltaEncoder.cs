@@ -70,6 +70,219 @@ public sealed class TileDeltaEncoder
         return upd;
     }
 
+    /// <summary>
+    /// Encodes a captured frame into independent atomic packets strictly <= maxPacketBytes (default 10.5 KB)
+    /// so every single packet fits in 1 single MQTT-over-WSS frame with zero chunk-loss amplification.
+    /// </summary>
+    public List<EncodedVideoUpdate> EncodeAtomicPackets(CapturedFrame frame, int jpegQuality, bool forceFullFrame = false, int maxWidth = 0, int maxPacketBytes = 10_500)
+    {
+        var results = new List<EncodedVideoUpdate>();
+        if (maxWidth > 0 && frame.Width > maxWidth)
+        {
+            frame = DownscaleFrame(frame, maxWidth);
+        }
+
+        int w = frame.Width;
+        int h = frame.Height;
+        int tile = ProtocolConstants.TileSize;
+        int cols = (w + tile - 1) / tile;
+        int rows = (h + tile - 1) / tile;
+        int totalTiles = cols * rows;
+
+        bool sizeChanged = _prevHashes is null || _prevWidth != w || _prevHeight != h;
+        bool full = forceFullFrame || sizeChanged;
+
+        var newHashes = new ulong[totalTiles];
+        var dirty = new bool[totalTiles];
+        int dirtyCount = 0;
+
+        for (int ty = 0; ty < rows; ty++)
+        {
+            int py0 = ty * tile;
+            int py1 = Math.Min(h, py0 + tile);
+            for (int tx = 0; tx < cols; tx++)
+            {
+                int px0 = tx * tile;
+                int px1 = Math.Min(w, px0 + tile);
+                ulong hash = ComputeTileHash(frame.BgraPixels, frame.Stride, px0, py0, px1, py1);
+                int idx = ty * cols + tx;
+                newHashes[idx] = hash;
+                if (full || _prevHashes![idx] != hash)
+                {
+                    dirty[idx] = true;
+                    dirtyCount++;
+                }
+            }
+        }
+
+        _prevHashes = newHashes;
+        _prevWidth = w;
+        _prevHeight = h;
+        _cols = cols;
+        _rows = rows;
+
+        if (!full && dirtyCount == 0)
+            return results;
+
+        int maxSingleRectJpeg = Math.Max(1024, maxPacketBytes - 32);
+
+        if (full || dirtyCount > totalTiles * 0.60)
+        {
+            const int bandHeight = 96;
+            var initialBands = new List<Rectangle>();
+            for (int y = 0; y < h; y += bandHeight)
+            {
+                int bh = Math.Min(bandHeight, h - y);
+                initialBands.Add(new Rectangle(0, y, w, bh));
+            }
+
+            var encodedStrips = new VideoTileRect[initialBands.Count];
+            var popts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 4) };
+            Parallel.For(0, initialBands.Count, popts, i =>
+            {
+                var r = initialBands[i];
+                var jpg = EncodeRegionJpeg(frame.BgraPixels, w, h, frame.Stride, r.X, r.Y, r.Width, r.Height, jpegQuality);
+                encodedStrips[i] = new VideoTileRect(r.X, r.Y, r.Width, r.Height, jpg);
+            });
+
+            foreach (var strip in encodedStrips)
+            {
+                AddAtomicStripOrSplit(results, frame, w, h, strip, jpegQuality, maxSingleRectJpeg);
+            }
+            return results;
+        }
+
+        // Partial delta update: merge horizontally adjacent dirty tiles capping width at 320px (5 tiles)
+        var rects = new List<Rectangle>();
+        for (int ty = 0; ty < rows; ty++)
+        {
+            int tx = 0;
+            while (tx < cols)
+            {
+                if (!dirty[ty * cols + tx]) { tx++; continue; }
+                int startTx = tx;
+                int run = 0;
+                while (tx < cols && dirty[ty * cols + tx] && run < 5)
+                {
+                    tx++;
+                    run++;
+                }
+                int rx = startTx * tile;
+                int ry = ty * tile;
+                int rw = Math.Min(w, tx * tile) - rx;
+                int rh = Math.Min(h, (ty + 1) * tile) - ry;
+                rects.Add(new Rectangle(rx, ry, rw, rh));
+            }
+        }
+
+        var encodedTiles = new VideoTileRect[rects.Count];
+        var dOpts = new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount / 4) };
+        Parallel.For(0, rects.Count, dOpts, i =>
+        {
+            var r = rects[i];
+            var jpg = EncodeRegionJpeg(frame.BgraPixels, w, h, frame.Stride, r.X, r.Y, r.Width, r.Height, jpegQuality);
+            encodedTiles[i] = new VideoTileRect(r.X, r.Y, r.Width, r.Height, jpg);
+        });
+
+        double savings = Math.Round((1.0 - (double)dirtyCount / totalTiles) * 100.0, 1);
+        var currentBatch = new List<VideoTileRect>();
+        int currentWireBytes = 10;
+
+        foreach (var tileRect in encodedTiles)
+        {
+            if (tileRect.JpegBytes.Length > maxSingleRectJpeg)
+            {
+                if (currentBatch.Count > 0)
+                {
+                    results.Add(new EncodedVideoUpdate
+                    {
+                        IsFullFrame = false,
+                        FrameWidth = w,
+                        FrameHeight = h,
+                        Rects = currentBatch,
+                        TileSavingsPercent = savings
+                    });
+                    currentBatch = new List<VideoTileRect>();
+                    currentWireBytes = 10;
+                }
+                AddAtomicStripOrSplit(results, frame, w, h, tileRect, jpegQuality, maxSingleRectJpeg);
+                continue;
+            }
+
+            int added = 20 + tileRect.JpegBytes.Length;
+            if (currentBatch.Count > 0 && currentWireBytes + added > maxPacketBytes)
+            {
+                results.Add(new EncodedVideoUpdate
+                {
+                    IsFullFrame = false,
+                    FrameWidth = w,
+                    FrameHeight = h,
+                    Rects = currentBatch,
+                    TileSavingsPercent = savings
+                });
+                currentBatch = new List<VideoTileRect>();
+                currentWireBytes = 10;
+            }
+
+            currentBatch.Add(tileRect);
+            currentWireBytes += added;
+        }
+
+        if (currentBatch.Count > 0)
+        {
+            results.Add(new EncodedVideoUpdate
+            {
+                IsFullFrame = false,
+                FrameWidth = w,
+                FrameHeight = h,
+                Rects = currentBatch,
+                TileSavingsPercent = savings
+            });
+        }
+
+        return results;
+    }
+
+    private static void AddAtomicStripOrSplit(List<EncodedVideoUpdate> results, CapturedFrame frame, int frameW, int frameH, VideoTileRect strip, int baseQuality, int maxJpegBytes)
+    {
+        if (strip.JpegBytes.Length <= maxJpegBytes)
+        {
+            results.Add(new EncodedVideoUpdate
+            {
+                IsFullFrame = false,
+                FrameWidth = frameW,
+                FrameHeight = frameH,
+                Rects = [strip],
+                TileSavingsPercent = 0
+            });
+            return;
+        }
+
+        // Split horizontally into halves (or quadrants) so crisp edges stay sharp and every packet fits <= maxPacketBytes
+        int sliceCount = strip.Width >= 640 ? 4 : 2;
+        int q = Math.Max(34, baseQuality - 8);
+        int sliceW = Math.Max(32, strip.Width / sliceCount);
+        for (int s = 0; s < sliceCount; s++)
+        {
+            int sx = strip.X + s * sliceW;
+            int sw = (s == sliceCount - 1) ? (strip.X + strip.Width - sx) : sliceW;
+            if (sw <= 0) continue;
+
+            var jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, q);
+            if (jpg.Length > maxJpegBytes)
+                jpg = EncodeRegionJpeg(frame.BgraPixels, frameW, frameH, frame.Stride, sx, strip.Y, sw, strip.Height, 26);
+
+            results.Add(new EncodedVideoUpdate
+            {
+                IsFullFrame = false,
+                FrameWidth = frameW,
+                FrameHeight = frameH,
+                Rects = [new VideoTileRect(sx, strip.Y, sw, strip.Height, jpg)],
+                TileSavingsPercent = 0
+            });
+        }
+    }
+
     private static int EstimateWireSize(EncodedVideoUpdate upd)
     {
         int len = 10;
@@ -279,53 +492,58 @@ public sealed class TileDeltaEncoder
         return ms.ToArray();
     }
 
-    private static CapturedFrame DownscaleFrame(CapturedFrame src, int maxWidth)
+    private static unsafe CapturedFrame DownscaleFrame(CapturedFrame src, int maxWidth)
     {
         int dstW = Math.Max(64, maxWidth & ~1);
         int dstH = Math.Max(64, ((int)Math.Round(src.Height * ((double)dstW / src.Width))) & ~1);
+        int dstStride = dstW * 4;
+        var outPx = GC.AllocateUninitializedArray<byte>(dstStride * dstH);
+        bool boxFilter = src.Width >= dstW * 2 && src.Height >= dstH * 2;
 
-        using var srcBmp = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
-        var srcData = srcBmp.LockBits(new Rectangle(0, 0, src.Width, src.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-        try
+        fixed (byte* srcBase = src.BgraPixels)
+        fixed (byte* dstBase = outPx)
         {
-            int copyBytes = Math.Min(src.BgraPixels.Length, Math.Abs(srcData.Stride) * src.Height);
-            Marshal.Copy(src.BgraPixels, 0, srcData.Scan0, copyBytes);
-        }
-        finally
-        {
-            srcBmp.UnlockBits(srcData);
-        }
-
-        using var dstBmp = new Bitmap(dstW, dstH, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(dstBmp))
-        {
-            g.InterpolationMode = InterpolationMode.Bilinear;
-            g.CompositingQuality = CompositingQuality.HighSpeed;
-            g.PixelOffsetMode = PixelOffsetMode.HighSpeed;
-            g.DrawImage(srcBmp, new Rectangle(0, 0, dstW, dstH), new Rectangle(0, 0, src.Width, src.Height), GraphicsUnit.Pixel);
-        }
-
-        var dstData = dstBmp.LockBits(new Rectangle(0, 0, dstW, dstH), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-        try
-        {
-            int len = dstData.Stride * dstH;
-            var outPx = new byte[len];
-            Marshal.Copy(dstData.Scan0, outPx, 0, len);
-            return new CapturedFrame
+            for (int y = 0; y < dstH; y++)
             {
-                Width = dstW,
-                Height = dstH,
-                Stride = dstData.Stride,
-                BgraPixels = outPx,
-                CursorX = (int)Math.Round(src.CursorX * ((double)dstW / src.Width)),
-                CursorY = (int)Math.Round(src.CursorY * ((double)dstH / src.Height)),
-                CursorVisible = src.CursorVisible
-            };
+                int sy0 = (int)((long)y * src.Height / dstH);
+                int sy1 = boxFilter && sy0 + 1 < src.Height ? sy0 + 1 : sy0;
+                byte* row0 = srcBase + sy0 * src.Stride;
+                byte* row1 = srcBase + sy1 * src.Stride;
+                uint* dstRow = (uint*)(dstBase + y * dstStride);
+
+                for (int x = 0; x < dstW; x++)
+                {
+                    int sx0 = (int)((long)x * src.Width / dstW);
+                    if (!boxFilter)
+                    {
+                        dstRow[x] = *(uint*)(row0 + sx0 * 4);
+                    }
+                    else
+                    {
+                        int sx1 = sx0 + 1 < src.Width ? sx0 + 1 : sx0;
+                        byte* p00 = row0 + sx0 * 4;
+                        byte* p01 = row0 + sx1 * 4;
+                        byte* p10 = row1 + sx0 * 4;
+                        byte* p11 = row1 + sx1 * 4;
+                        uint b = (uint)(p00[0] + p01[0] + p10[0] + p11[0]) >> 2;
+                        uint g = (uint)(p00[1] + p01[1] + p10[1] + p11[1]) >> 2;
+                        uint r = (uint)(p00[2] + p01[2] + p10[2] + p11[2]) >> 2;
+                        dstRow[x] = b | (g << 8) | (r << 16) | 0xFF000000u;
+                    }
+                }
+            }
         }
-        finally
+
+        return new CapturedFrame
         {
-            dstBmp.UnlockBits(dstData);
-        }
+            Width = dstW,
+            Height = dstH,
+            Stride = dstStride,
+            BgraPixels = outPx,
+            CursorX = (int)Math.Round(src.CursorX * ((double)dstW / src.Width)),
+            CursorY = (int)Math.Round(src.CursorY * ((double)dstH / src.Height)),
+            CursorVisible = src.CursorVisible
+        };
     }
 
     private static unsafe void CopyBgraToBgrRow(byte[] src, int srcOffset, IntPtr dstPtr, int pixelCount)

@@ -66,6 +66,13 @@ public sealed class ClientSession : IAsyncDisposable
     private long _packetsReceivedCount;
     private string _lastVideoError = string.Empty;
     private bool _loggedFirstUiRender;
+    private readonly object _coverageLock = new();
+    private bool[]? _coverageCells;
+    private int _coverageCols;
+    private int _coverageRows;
+    private int _coverageW;
+    private int _coverageH;
+    private volatile bool _baseFrameComplete;
 
     public SessionTelemetry Telemetry { get; } = new();
     public SessionPermissions GrantedPermissions { get; private set; } = new();
@@ -75,6 +82,7 @@ public sealed class ClientSession : IAsyncDisposable
     public WriteableBitmap? FrameBitmap => _bitmap;
     public bool IsConnected => _channel?.IsConnected == true;
     public bool IsAudioEnabled => _audioEnabled;
+    public bool IsBaseFrameComplete => _baseFrameComplete;
     public long FramesReceivedCount => Interlocked.Read(ref _framesReceivedCount);
     public long PacketsReceivedCount => Interlocked.Read(ref _packetsReceivedCount);
     public int ReconnectCount => (_channel as EncryptedTransportChannel)?.InnerReconnectCount ?? 0;
@@ -331,8 +339,9 @@ public sealed class ClientSession : IAsyncDisposable
         {
             encCh.InnerReconnected += cnt =>
             {
-                Services.SessionLogger.Log("CLIENT", $"Transport reconnected (#{cnt}) on {ActiveBrokerDisplay}");
-                _ = SendSystemActionAsync(SystemActionKind.RequestKeyFrame);
+                Services.SessionLogger.Log("CLIENT", $"Transport rotated (#{cnt}) on {ActiveBrokerDisplay}");
+                if (!_baseFrameComplete)
+                    _ = SendSystemActionAsync(SystemActionKind.RequestKeyFrame);
             };
         }
 
@@ -347,13 +356,13 @@ public sealed class ClientSession : IAsyncDisposable
     {
         try
         {
-            int[] delaysMs = [900, 1800, 2500, 2500, 2500, 2500, 2500, 2500];
+            int[] delaysMs = [1500, 3000, 3000, 3000, 3000, 3000];
             for (int i = 0; i < delaysMs.Length; i++)
             {
                 await Task.Delay(delaysMs[i], ct).ConfigureAwait(false);
-                if (FramesReceivedCount == 0 && IsConnected)
+                if (!_baseFrameComplete && IsConnected)
                 {
-                    Services.SessionLogger.Log("CLIENT", $"RequestKeyFrame watchdog #{i + 1} (rxPkts={PacketsReceivedCount}, broker={ActiveBrokerDisplay})");
+                    Services.SessionLogger.Log("CLIENT", $"RequestKeyFrame coverage watchdog #{i + 1} (frames={FramesReceivedCount}, rxPkts={PacketsReceivedCount}, broker={ActiveBrokerDisplay})");
                     await SendSystemActionAsync(SystemActionKind.RequestKeyFrame).ConfigureAwait(false);
                 }
                 else
@@ -363,6 +372,46 @@ public sealed class ClientSession : IAsyncDisposable
             }
         }
         catch { }
+    }
+
+    private void UpdateFrameCoverage(int w, int h, List<VideoTileRect> rects)
+    {
+        lock (_coverageLock)
+        {
+            if (_coverageCells is null || _coverageW != w || _coverageH != h)
+            {
+                _coverageW = w;
+                _coverageH = h;
+                _coverageCols = Math.Max(1, (w + 319) / 320);
+                _coverageRows = Math.Max(1, (h + 63) / 64);
+                _coverageCells = new bool[_coverageCols * _coverageRows];
+                _baseFrameComplete = false;
+            }
+
+            foreach (var r in rects)
+            {
+                int c0 = Math.Clamp(r.X / 320, 0, _coverageCols - 1);
+                int c1 = Math.Clamp((r.X + Math.Max(1, r.Width) - 1) / 320, 0, _coverageCols - 1);
+                int r0 = Math.Clamp(r.Y / 64, 0, _coverageRows - 1);
+                int r1 = Math.Clamp((r.Y + Math.Max(1, r.Height) - 1) / 64, 0, _coverageRows - 1);
+                for (int rr = r0; rr <= r1; rr++)
+                {
+                    int baseOff = rr * _coverageCols;
+                    for (int cc = c0; cc <= c1; cc++)
+                        _coverageCells[baseOff + cc] = true;
+                }
+            }
+
+            if (!_baseFrameComplete)
+            {
+                bool allDone = true;
+                for (int i = 0; i < _coverageCells.Length; i++)
+                {
+                    if (!_coverageCells[i]) { allDone = false; break; }
+                }
+                _baseFrameComplete = allDone;
+            }
+        }
     }
 
     private async Task<(ITransportChannel? Channel, SconPacket? HostKey)> ConnectViaInviteCascadeAsync(
@@ -628,6 +677,7 @@ public sealed class ClientSession : IAsyncDisposable
                         }
                         Telemetry.FrameWidth = w;
                         Telemetry.FrameHeight = h;
+                        UpdateFrameCoverage(w, h, rects);
                         FrameDimensionsReceived?.Invoke(w, h);
                         ApplyVideoUpdate(w, h, rects);
                         break;
@@ -823,7 +873,7 @@ public sealed class ClientSession : IAsyncDisposable
                 }));
             }
 
-            disp.BeginInvoke(() =>
+            disp.BeginInvoke(System.Windows.Threading.DispatcherPriority.Render, () =>
             {
                 try
                 {

@@ -3,6 +3,7 @@ using System.Buffers.Binary;
 using System.IO.Compression;
 using System.Net.Sockets;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -335,24 +336,42 @@ public sealed class EncryptedTransportChannel : ITransportChannel
 
     public async Task<SconPacket?> ReceivePacketAsync(CancellationToken ct = default)
     {
-        var raw = await _inner.ReceivePacketAsync(ct).ConfigureAwait(false);
-        if (raw is null) return null;
-        if (raw.Type == PacketType.Disconnect && raw.Payload.Length == 0)
-            return raw;
-
-        var plainEnvelope = _crypto.Decrypt(raw.Payload);
-        if (plainEnvelope.Length < 2)
-            throw new InvalidDataException("Encrypted envelope malformed.");
-
-        var innerType = (PacketType)plainEnvelope[0];
-        byte innerFlags = plainEnvelope[1];
-        var payload = plainEnvelope.AsSpan(2).ToArray();
-        if ((innerFlags & FrameCodec.FlagCompressed) != 0)
+        while (true)
         {
-            payload = FrameCodec.Decompress(payload);
-            innerFlags &= unchecked((byte)~FrameCodec.FlagCompressed);
+            var raw = await _inner.ReceivePacketAsync(ct).ConfigureAwait(false);
+            if (raw is null) return null;
+            if (raw.Type == PacketType.Disconnect && raw.Payload.Length == 0)
+                return raw;
+            if (raw.Type == PacketType.KeyExchange && raw.Payload.Length == 65 && raw.Payload[0] == 0x04)
+            {
+                // Ignore duplicate pre-handshake KeyExchange retransmission after ECDH completed
+                continue;
+            }
+
+            byte[] plainEnvelope;
+            try
+            {
+                plainEnvelope = _crypto.Decrypt(raw.Payload);
+            }
+            catch (CryptographicException ex) when (ex.Message.Contains("Replay", StringComparison.OrdinalIgnoreCase))
+            {
+                // Ignore harmless duplicate delivery during proactive socket rotation overlap
+                continue;
+            }
+
+            if (plainEnvelope.Length < 2)
+                throw new InvalidDataException("Encrypted envelope malformed.");
+
+            var innerType = (PacketType)plainEnvelope[0];
+            byte innerFlags = plainEnvelope[1];
+            var payload = plainEnvelope.AsSpan(2).ToArray();
+            if ((innerFlags & FrameCodec.FlagCompressed) != 0)
+            {
+                payload = FrameCodec.Decompress(payload);
+                innerFlags &= unchecked((byte)~FrameCodec.FlagCompressed);
+            }
+            return new SconPacket(innerType, innerFlags, payload);
         }
-        return new SconPacket(innerType, innerFlags, payload);
     }
 
     public async ValueTask DisposeAsync()
