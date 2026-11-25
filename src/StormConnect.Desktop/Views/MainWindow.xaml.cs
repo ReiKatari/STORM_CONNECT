@@ -20,7 +20,8 @@ using Button = System.Windows.Controls.Button;
 namespace StormConnect.Desktop.Views;
 
 public sealed record FileGridRow(string Name, string FullPath, bool IsDirectory, long SizeBytes, string SizeDisplay, string ModifiedDisplay);
-public sealed record AddressGridRow(AddressBookEntry Entry, string Alias, string FormattedId, string HostOrIp, string Group, string MacAddress, string ConnectLabel, string WolLabel);
+public sealed record AddressGridRow(AddressBookEntry Entry, string Alias, string FormattedId, string HostOrIp, string Group, string MacAddress, string AuthDisplay, string ConnectLabel, string WolLabel);
+public sealed record AuditGridRow(string TimestampDisplay, string Peer, string Mode, string Action);
 
 public partial class MainWindow : Window
 {
@@ -50,6 +51,9 @@ public partial class MainWindow : Window
 
     private TaskCompletionSource<ConsentDecisionPayload>? _consentTcs;
     private TaskCompletionSource<string?>? _authTcs;
+    private bool _lastAuthRemember;
+    private string _lastAuthAlias = string.Empty;
+    private IReadOnlyList<MonitorInfo> _currentMonitors = [];
 
     public MainWindow()
     {
@@ -166,9 +170,9 @@ public partial class MainWindow : Window
         _hostServer.ClientConnected += ctx => Dispatcher.Invoke(() =>
         {
             TxtActiveGuestsBadge.Text = $"{LocalizationService.T("ActiveIncoming")}: {_hostServer.ActiveClientCount}";
-            App.Settings.AddAudit($"{ctx.ClientName} ({ctx.ClientStormId})", ctx.Mode.ToString(), "Incoming Connected");
+            App.Settings.AddAudit($"{ctx.ClientName} ({ctx.ClientStormId})", ctx.Mode.ToString(), "IncomingConnected");
             RefreshAuditGrid();
-            _tray?.ShowBalloon("STORM CONNECT", $"{ctx.ClientName} ({ctx.Mode})");
+            _tray?.ShowBalloon("STORM CONNECT", $"{ctx.ClientName} ({LocalizationService.LocalizeMode(ctx.Mode)})");
         });
         _hostServer.ClientDisconnected += _ => Dispatcher.Invoke(() =>
         {
@@ -213,7 +217,7 @@ public partial class MainWindow : Window
         int port = App.Settings.Current.DirectPort;
         string upnpText = _upnpResult?.Success == true
             ? $"{_upnpResult.Method}: {_upnpResult.ExternalIp}:{_upnpResult.MappedExternalPort}"
-            : "UPnP / NAT-PMP: N/A";
+            : $"UPnP / NAT-PMP: {LocalizationService.T("NotAvailable")}";
         TxtDirectAddresses.Text =
             $"LAN: {_lanIp ?? "-"}:{port}  |  VPN: {_vpnIp ?? "-"}\n" +
             $"IPv6: {_globalIpv6 ?? "-"}  |  {upnpText}  |  STUN: {_stunUdpEndpoint ?? "-"}";
@@ -238,6 +242,9 @@ public partial class MainWindow : Window
     {
         var s = App.Settings.Current;
         ChkAllowIncoming.IsChecked = s.AllowIncoming;
+        ChkEnableUnattendedDash.IsChecked = s.EnableUnattendedPassword;
+        ChkEnableUnattendedSettings.IsChecked = s.EnableUnattendedPassword;
+        UpdateUnattendedStatusUi();
         TxtRelayUrl.Text = s.RelayUrl;
         TxtDirectPort.Text = s.DirectPort.ToString();
         ChkEnableRelay.IsChecked = s.EnableRelay;
@@ -251,6 +258,15 @@ public partial class MainWindow : Window
         UiScaleTransform.ScaleX = SliderUiScale.Value;
         UiScaleTransform.ScaleY = SliderUiScale.Value;
         TxtScaleVal.Text = $"{Math.Round(SliderUiScale.Value * 100)}%";
+    }
+
+    private void UpdateUnattendedStatusUi()
+    {
+        string badge = App.Settings.HasUnattendedPassword
+            ? LocalizationService.T("UnattendedSetBadge")
+            : LocalizationService.T("UnattendedNotSetBadge");
+        TxtUnattendedStatusDash.Text = badge;
+        TxtUnattendedStatusSettings.Text = badge;
     }
 
     private void ApplyLocalization()
@@ -283,6 +299,9 @@ public partial class MainWindow : Window
         TxtLabelPin.Text = T("OneTimePin");
         TxtBtnRefreshPin.Text = T("RefreshPin");
         ChkAllowIncoming.Content = T("IncomingStatus");
+        ChkEnableUnattendedDash.Content = T("EnableUnattendedLogin");
+        ChkEnableUnattendedSettings.Content = T("EnableUnattendedLogin");
+        UpdateUnattendedStatusUi();
         TxtLabelQuickConnect.Text = T("QuickConnectTitle");
         TxtTargetInput.ToolTip = T("TargetPlaceholder");
         TxtBtnConnect.Text = T("ConnectBtn");
@@ -318,6 +337,8 @@ public partial class MainWindow : Window
 
         TxtBtnTaskMgr.Text = T("CtrlAltDel");
         TxtBtnLockRemote.Text = T("LockRemote");
+        TxtBtnMoveWindow.Text = T("BtnMoveWindow");
+        BtnMoveWindowMonitor.ToolTip = T("TipMoveWindow");
         TxtBtnScreenshot.Text = T("Screenshot");
         TxtBtnChat.Text = T("Chat");
         TxtChatTitle.Text = T("Chat").ToUpperInvariant();
@@ -326,6 +347,7 @@ public partial class MainWindow : Window
         TxtNoActiveSession.Text = T("NoActiveSession");
         TxtDropFilesHint.Text = T("DropFilesHint");
         TxtBtnAudio.Text = $"{T("AudioToggle")}: {(_audioEnabled ? T("StateOn") : T("StateOff"))}";
+        RebuildMonitorPills();
 
         TxtLabelLocalFiles.Text = T("LocalFiles");
         TxtLabelRemoteFiles.Text = T("RemoteFiles");
@@ -349,6 +371,7 @@ public partial class MainWindow : Window
         TxtAddHost.ToolTip = T("HintHost");
         TxtAddMac.ToolTip = T("HintMac");
         TxtAddGroup.ToolTip = T("HintGroup");
+        TxtAddDevPwdLabel.Text = T("AddDevicePwdLabel");
         TxtAddDevCancel.Text = T("Cancel");
         TxtAddDevSave.Text = T("Ok");
 
@@ -357,6 +380,7 @@ public partial class MainWindow : Window
         ColBookHost.Header = T("ColHost");
         ColBookGroup.Header = T("ColGroup");
         ColBookMac.Header = T("ColMac");
+        ColBookAuth.Header = T("ColAuth");
         ColBookActions.Header = T("ColActions");
 
         TxtLabelServerlessTitle.Text = T("ServerlessCardTitle");
@@ -397,6 +421,8 @@ public partial class MainWindow : Window
         TxtConsentDecline.Text = T("Decline");
         TxtAuthTitle.Text = T("AuthPromptTitle");
         TxtAuthMsg.Text = T("AuthPromptMsg");
+        ChkRememberConnection.Content = T("RememberConnectionChk");
+        TxtRememberAlias.ToolTip = T("RememberAliasHint");
         TxtAuthOk.Text = T("Ok");
         TxtAuthCancel.Text = T("Cancel");
         TxtUpdateTitle.Text = T("UpdateAvailableTitle");
@@ -407,7 +433,9 @@ public partial class MainWindow : Window
 
         UpdateRelayBadge(_hostServer?.IsRelayConnected == true);
         TxtActiveGuestsBadge.Text = $"{T("ActiveIncoming")}: {_hostServer?.ActiveClientCount ?? 0}";
+        UpdateServerlessSummaryUi();
         RefreshAddressBookGrid();
+        RefreshAuditGrid();
         RefreshLanDevices(_lanDiscovery.CurrentDevices);
 
         _initializingUi = prevInit;
@@ -415,8 +443,12 @@ public partial class MainWindow : Window
 
     private void ApplyThemeVisuals()
     {
+        var ff = new System.Windows.Media.FontFamily(ThemeService.CurrentFont.WpfFamily);
+        FontFamily = ff;
+        System.Windows.Documents.TextElement.SetFontFamily(this, ff);
         AuroraBackdrop.Visibility = ThemeService.CurrentTheme.HasAuroraFx ? Visibility.Visible : Visibility.Collapsed;
         TelemetryChart.Redraw();
+        RebuildMonitorPills();
     }
 
     private void UpdateRelayBadge(bool online)
@@ -488,6 +520,15 @@ public partial class MainWindow : Window
             await _clientSession.DisposeAsync();
 
         var s = App.Settings.Current;
+        var savedEntry = App.Settings.FindAddressBookEntry(target);
+        string? savedSecret = savedEntry is not null && savedEntry.AutoLoginWithPassword
+            ? SettingsStore.UnprotectSecret(savedEntry.SavedPasswordProtectedBase64)
+            : null;
+        bool usedSavedSecret = false;
+        string? lastEnteredSecret = null;
+        _lastAuthRemember = false;
+        _lastAuthAlias = savedEntry?.Alias ?? string.Empty;
+
         _clientSession = new ClientSession(s.StormId, _clipboardWatcher);
         _clientSession.StatusChanged += msg => Dispatcher.Invoke(() => TxtConnectStatus.Text = msg);
         _clientSession.FrameUpdated += bmp =>
@@ -497,8 +538,10 @@ public partial class MainWindow : Window
         };
         _clientSession.MonitorsUpdated += mons => Dispatcher.Invoke(() =>
         {
+            _currentMonitors = mons;
             CmbMonitorSelect.ItemsSource = mons;
             if (mons.Count > 0) CmbMonitorSelect.SelectedIndex = 0;
+            RebuildMonitorPills();
         });
         _clientSession.TelemetryUpdated += tel => Dispatcher.Invoke(() =>
         {
@@ -506,7 +549,7 @@ public partial class MainWindow : Window
             BadgeRtt.Text = $"{LocalizationService.T("LabelRtt")}: {tel.RttMs} {LocalizationService.T("UnitMs")}";
             BadgeMbps.Text = $"{tel.BandwidthMbps:0.##} {LocalizationService.T("UnitMbps")}";
             BadgeSavings.Text = $"{LocalizationService.T("LabelDelta")}: {tel.TileSavingsPercent:0.#}%";
-            TxtViewerHud.Text = $"{tel.Mode} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} FPS | {tel.RttMs} {LocalizationService.T("UnitMs")}";
+            TxtViewerHud.Text = $"{LocalizationService.LocalizeMode(tel.Mode)} | {tel.FrameWidth}x{tel.FrameHeight} | {tel.Fps:0.#} {LocalizationService.T("LabelFps")} | {tel.RttMs} {LocalizationService.T("UnitMs")}";
             TelemetryChart.PushSample(tel.Fps, tel.BandwidthMbps);
         });
         _clientSession.FileListReceived += fl => Dispatcher.Invoke(() => PopulateRemoteFiles(fl));
@@ -523,10 +566,12 @@ public partial class MainWindow : Window
         _clientSession.ChatReceived += msg => Dispatcher.Invoke(() => AppendChatMessage(msg));
         _clientSession.Disconnected += reason => Dispatcher.Invoke(() =>
         {
+            _currentMonitors = [];
             TxtConnectStatus.Text = $"{LocalizationService.T("StatusDisconnected")}: {reason}";
             TxtViewerHud.Text = LocalizationService.T("ViewerIdle");
             CmbMonitorSelect.ItemsSource = new[] { LocalizationService.T("MonitorNone") };
             CmbMonitorSelect.SelectedIndex = 0;
+            RebuildMonitorPills();
             ViewerEmptyState.Visibility = Visibility.Visible;
         });
 
@@ -537,10 +582,34 @@ public partial class MainWindow : Window
                 target,
                 s.RelayUrl,
                 _lanDiscovery.CurrentDevices,
-                PromptOutgoingAuthAsync,
+                async (hostName, allowUnattended) =>
+                {
+                    if (!string.IsNullOrWhiteSpace(savedSecret) && !usedSavedSecret)
+                    {
+                        usedSavedSecret = true;
+                        lastEnteredSecret = savedSecret;
+                        return savedSecret;
+                    }
+                    lastEnteredSecret = await PromptOutgoingAuthAsync(hostName, allowUnattended, savedEntry?.Alias ?? target).ConfigureAwait(false);
+                    return lastEnteredSecret;
+                },
                 s.ConnectionMethodIndex);
 
-            App.Settings.AddAudit(target, _clientSession.Telemetry.Mode.ToString(), "Outgoing Connected");
+            _audioEnabled = _clientSession.IsAudioEnabled;
+            TxtBtnAudio.Text = $"{LocalizationService.T("AudioToggle")}: {(_audioEnabled ? LocalizationService.T("StateOn") : LocalizationService.T("StateOff"))}";
+
+            if (_lastAuthRemember || (!string.IsNullOrWhiteSpace(lastEnteredSecret) && !usedSavedSecret && _lastAuthRemember))
+            {
+                App.Settings.UpsertSavedConnection(target, _lastAuthAlias, lastEnteredSecret, _clientSession.RemoteStormId);
+                RefreshAddressBookGrid();
+            }
+            else if (usedSavedSecret && savedEntry is not null)
+            {
+                savedEntry.LastConnectedUtc = DateTime.UtcNow;
+                App.Settings.Save();
+            }
+
+            App.Settings.AddAudit(target, _clientSession.Telemetry.Mode.ToString(), "OutgoingConnected");
             RefreshAuditGrid();
             NavViewer.IsChecked = true;
             RemoteViewportHost.Focus();
@@ -577,13 +646,15 @@ public partial class MainWindow : Window
         }).Task.Unwrap();
     }
 
-    private Task<string?> PromptOutgoingAuthAsync(string hostName, bool allowUnattended)
+    private Task<string?> PromptOutgoingAuthAsync(string hostName, bool allowUnattended, string suggestedAlias)
     {
         return Dispatcher.InvokeAsync(() =>
         {
             _authTcs?.TrySetResult(null);
             _authTcs = new TaskCompletionSource<string?>();
             PwdRemoteAuth.Password = string.Empty;
+            ChkRememberConnection.IsChecked = true;
+            TxtRememberAlias.Text = !string.IsNullOrWhiteSpace(hostName) ? hostName : suggestedAlias;
             ModalAuth.Visibility = Visibility.Visible;
             PwdRemoteAuth.Focus();
             return _authTcs.Task;
@@ -754,6 +825,21 @@ public partial class MainWindow : Window
         App.Settings.Save();
     }
 
+    private void ChkEnableUnattended_Changed(object sender, RoutedEventArgs e)
+    {
+        if (_initializingUi) return;
+        bool val = sender is System.Windows.Controls.CheckBox cb && cb.IsChecked == true;
+        bool prev = _initializingUi;
+        _initializingUi = true;
+        ChkEnableUnattendedDash.IsChecked = val;
+        ChkEnableUnattendedSettings.IsChecked = val;
+        _initializingUi = prev;
+
+        App.Settings.Current.EnableUnattendedPassword = val;
+        App.Settings.Save();
+        UpdateUnattendedStatusUi();
+    }
+
     private void BtnConnect_Click(object sender, RoutedEventArgs e) => _ = ConnectToTargetAsync(TxtTargetInput.Text);
     private void TxtTargetInput_KeyDown(object sender, System.Windows.Input.KeyEventArgs e)
     {
@@ -794,6 +880,8 @@ public partial class MainWindow : Window
 
     private void BtnAuthOk_Click(object sender, RoutedEventArgs e)
     {
+        _lastAuthRemember = ChkRememberConnection.IsChecked == true;
+        _lastAuthAlias = TxtRememberAlias.Text.Trim();
         ModalAuth.Visibility = Visibility.Collapsed;
         _authTcs?.TrySetResult(PwdRemoteAuth.Password);
     }
@@ -811,10 +899,56 @@ public partial class MainWindow : Window
     #endregion
 
     #region Remote Viewer Input & Toolbar
+    private void RebuildMonitorPills()
+    {
+        if (MonitorPillsPanel is null) return;
+        MonitorPillsPanel.Children.Clear();
+
+        if (_currentMonitors.Count == 0)
+        {
+            BtnMoveWindowMonitor.IsEnabled = false;
+            return;
+        }
+
+        BtnMoveWindowMonitor.IsEnabled = _currentMonitors.Count(m => m.Index >= 0) >= 2;
+        int selectedIndex = (CmbMonitorSelect.SelectedItem as MonitorInfo)?.Index ?? 0;
+
+        foreach (var mon in _currentMonitors)
+        {
+            bool active = mon.Index == selectedIndex;
+            string label = mon.Index == -1
+                ? $"{LocalizationService.T("AllMonitorsShort")} ({mon.Width}x{mon.Height})"
+                : $"{LocalizationService.T("SelectMonitor")} {mon.Index + 1} ({mon.Width}x{mon.Height})";
+
+            var pill = new Button
+            {
+                Style = (Style)FindResource(active ? "StormPrimaryBtn" : "StormSecondaryBtn"),
+                Padding = new Thickness(12, 6, 12, 6),
+                Margin = new Thickness(0, 0, 6, 4),
+                Content = new TextBlock
+                {
+                    Text = label,
+                    FontSize = 12,
+                    Foreground = active ? Brushes.White : (Brush)FindResource("ThemeTextPrimary"),
+                    FontFamily = new System.Windows.Media.FontFamily(ThemeService.CurrentFont.WpfFamily)
+                }
+            };
+            pill.Click += (_, _) => CmbMonitorSelect.SelectedItem = mon;
+            MonitorPillsPanel.Children.Add(pill);
+        }
+    }
+
+    private void BtnMoveWindowMonitor_Click(object sender, RoutedEventArgs e)
+    {
+        if (_clientSession?.IsConnected == true)
+            _ = _clientSession.SendSystemActionAsync(SystemActionKind.MoveWindowNextMonitor);
+    }
+
     private void CmbMonitorSelect_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
         if (_clientSession is null || CmbMonitorSelect.SelectedItem is not MonitorInfo m) return;
         _ = _clientSession.SelectMonitorAsync(m.Index, _currentQuality);
+        RebuildMonitorPills();
     }
 
     private void CmbQuality_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -883,7 +1017,7 @@ public partial class MainWindow : Window
             Margin = new Thickness(0, 0, 0, 6)
         };
         var sp = new StackPanel();
-        sp.Children.Add(new TextBlock { Text = $"{msg.SenderName} ({msg.TimestampUtc.ToLocalTime():HH:mm})", FontSize = 10.5, Foreground = (Brush)FindResource("ThemeAccent"), FontWeight = FontWeights.Bold });
+        sp.Children.Add(new TextBlock { Text = $"{msg.SenderName} ({msg.TimestampUtc.ToLocalTime():dd.MM.yyyy HH:mm})", FontSize = 10.5, Foreground = (Brush)FindResource("ThemeAccent"), FontWeight = FontWeights.Bold });
         sp.Children.Add(new TextBlock { Text = msg.Text, FontSize = 12.5, TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 2, 0, 0) });
         b.Child = sp;
         ChatMessagesPanel.Children.Add(b);
@@ -1006,7 +1140,7 @@ public partial class MainWindow : Window
             e.IsDirectory,
             e.SizeBytes,
             e.IsDirectory ? "<DIR>" : FormatBytes(e.SizeBytes),
-            e.LastModifiedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))).ToList();
+            e.LastModifiedUtc.ToLocalTime().ToString("dd.MM.yyyy HH:mm"))).ToList();
     }
 
     private void PopulateRemoteFiles(FileListResponsePayload list)
@@ -1019,7 +1153,7 @@ public partial class MainWindow : Window
             e.IsDirectory,
             e.SizeBytes,
             e.IsDirectory ? "<DIR>" : FormatBytes(e.SizeBytes),
-            e.LastModifiedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm"))).ToList();
+            e.LastModifiedUtc.ToLocalTime().ToString("dd.MM.yyyy HH:mm"))).ToList();
     }
 
     private void GridLocalFiles_DoubleClick(object sender, MouseButtonEventArgs e)
@@ -1113,31 +1247,51 @@ public partial class MainWindow : Window
         string q = TxtBookSearch.Text.Trim();
         string connLbl = LocalizationService.T("ConnectBtn");
         string wolLbl = LocalizationService.T("WakeOnLan");
+        string defGroup = LocalizationService.T("DefaultGroup");
+        string authPwd = LocalizationService.T("AuthSavedPwd");
+        string authPin = LocalizationService.T("AuthPinOnly");
         var items = App.Settings.Current.AddressBook
             .Where(x => string.IsNullOrEmpty(q) ||
                         x.Alias.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                         x.StormId.Contains(q, StringComparison.OrdinalIgnoreCase) ||
                         x.HostOrIp.Contains(q, StringComparison.OrdinalIgnoreCase))
-            .Select(x => new AddressGridRow(x, x.Alias, DeviceIdentity.FormatId(x.StormId), x.HostOrIp, x.Group, x.MacAddress, connLbl, wolLbl))
+            .Select(x => new AddressGridRow(
+                x,
+                string.IsNullOrWhiteSpace(x.Alias) ? LocalizationService.T("DefaultDeviceName") : x.Alias,
+                DeviceIdentity.FormatId(x.StormId),
+                x.HostOrIp,
+                string.IsNullOrWhiteSpace(x.Group) ? defGroup : x.Group,
+                x.MacAddress,
+                !string.IsNullOrWhiteSpace(x.SavedPasswordProtectedBase64) ? authPwd : authPin,
+                connLbl,
+                wolLbl))
             .ToList();
         GridAddressBook.ItemsSource = items;
     }
 
     private void TxtBookSearch_TextChanged(object sender, TextChangedEventArgs e) => RefreshAddressBookGrid();
-    private void BtnAddDevice_Click(object sender, RoutedEventArgs e) => ModalAddDevice.Visibility = Visibility.Visible;
+    private void BtnAddDevice_Click(object sender, RoutedEventArgs e)
+    {
+        PwdAddDevicePassword.Password = string.Empty;
+        ModalAddDevice.Visibility = Visibility.Visible;
+    }
     private void BtnAddDevCancel_Click(object sender, RoutedEventArgs e) => ModalAddDevice.Visibility = Visibility.Collapsed;
 
     private void BtnAddDevSave_Click(object sender, RoutedEventArgs e)
     {
+        string pwd = PwdAddDevicePassword.Password;
         App.Settings.Current.AddressBook.Add(new AddressBookEntry
         {
-            Alias = string.IsNullOrWhiteSpace(TxtAddAlias.Text) ? "Remote Device" : TxtAddAlias.Text.Trim(),
+            Alias = string.IsNullOrWhiteSpace(TxtAddAlias.Text) ? LocalizationService.T("DefaultDeviceName") : TxtAddAlias.Text.Trim(),
             StormId = DeviceIdentity.NormalizeId(TxtAddStormId.Text),
             HostOrIp = TxtAddHost.Text.Trim(),
             MacAddress = TxtAddMac.Text.Trim(),
-            Group = string.IsNullOrWhiteSpace(TxtAddGroup.Text) ? "Workstations" : TxtAddGroup.Text.Trim()
+            Group = string.IsNullOrWhiteSpace(TxtAddGroup.Text) ? string.Empty : TxtAddGroup.Text.Trim(),
+            SavedPasswordProtectedBase64 = SettingsStore.ProtectSecret(pwd),
+            AutoLoginWithPassword = !string.IsNullOrWhiteSpace(pwd)
         });
         App.Settings.Save();
+        PwdAddDevicePassword.Password = string.Empty;
         ModalAddDevice.Visibility = Visibility.Collapsed;
         RefreshAddressBookGrid();
     }
@@ -1208,12 +1362,24 @@ public partial class MainWindow : Window
     {
         App.Settings.SetUnattendedPassword(PwdUnattended.Password);
         PwdUnattended.Password = string.Empty;
+        bool prev = _initializingUi;
+        _initializingUi = true;
+        ChkEnableUnattendedDash.IsChecked = App.Settings.Current.EnableUnattendedPassword;
+        ChkEnableUnattendedSettings.IsChecked = App.Settings.Current.EnableUnattendedPassword;
+        _initializingUi = prev;
+        UpdateUnattendedStatusUi();
         TxtConnectStatus.Text = LocalizationService.T("StatusPwdSaved");
     }
 
     private void BtnClearUnattended_Click(object sender, RoutedEventArgs e)
     {
         App.Settings.SetUnattendedPassword(null);
+        bool prev = _initializingUi;
+        _initializingUi = true;
+        ChkEnableUnattendedDash.IsChecked = false;
+        ChkEnableUnattendedSettings.IsChecked = false;
+        _initializingUi = prev;
+        UpdateUnattendedStatusUi();
         TxtConnectStatus.Text = LocalizationService.T("StatusPwdCleared");
     }
 
@@ -1242,8 +1408,13 @@ public partial class MainWindow : Window
 
     private void RefreshAuditGrid()
     {
-        GridAuditLog.ItemsSource = null;
-        GridAuditLog.ItemsSource = App.Settings.Current.AuditLogs.ToList();
+        GridAuditLog.ItemsSource = App.Settings.Current.AuditLogs
+            .Select(a => new AuditGridRow(
+                a.TimestampUtc.ToLocalTime().ToString("dd.MM.yyyy HH:mm"),
+                a.Peer,
+                LocalizationService.LocalizeMode(a.Mode),
+                LocalizationService.LocalizeAuditAction(a.Action)))
+            .ToList();
     }
 
     private async Task CheckUpdatesSilentlyAsync()

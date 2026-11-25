@@ -67,16 +67,16 @@ public static class ThemeService
 
     public static readonly IReadOnlyList<StormFontOption> Fonts =
     [
-        new("Inter", "Inter, Segoe UI, Arial"),
-        new("Plus Jakarta Sans", "Plus Jakarta Sans, Segoe UI, Arial"),
-        new("Geist Sans", "Geist, Segoe UI, Arial"),
-        new("Manrope", "Manrope, Segoe UI, Arial"),
-        new("Outfit", "Outfit, Segoe UI, Arial"),
-        new("Montserrat", "Montserrat, Segoe UI, Arial"),
-        new("Rubik", "Rubik, Segoe UI, Arial"),
-        new("Orbitron", "Orbitron, Rajdhani, Segoe UI"),
-        new("JetBrains Mono", "JetBrains Mono, Consolas"),
-        new("Cascadia Code", "Cascadia Code, Fira Code, Consolas")
+        new("Segoe UI", "Segoe UI"),
+        new("Bahnschrift", "Bahnschrift"),
+        new("Calibri", "Calibri"),
+        new("Verdana", "Verdana"),
+        new("Tahoma", "Tahoma"),
+        new("Trebuchet MS", "Trebuchet MS"),
+        new("Candara", "Candara"),
+        new("Georgia", "Georgia"),
+        new("Cascadia Code", "Cascadia Code, Consolas"),
+        new("Consolas", "Consolas")
     ];
 
     public static StormThemePalette CurrentTheme { get; private set; } = Themes[0];
@@ -126,10 +126,17 @@ public static class ThemeService
             45.0);
         res["ThemeAccentGradient"] = grad;
 
-        res["ThemeFontFamily"] = new System.Windows.Media.FontFamily(font.WpfFamily);
+        var fontFamily = new System.Windows.Media.FontFamily(font.WpfFamily);
+        res["ThemeFontFamily"] = fontFamily;
         res["ThemeScrollThumb"] = new SolidColorBrush(theme.IsLight
             ? System.Windows.Media.Color.FromArgb(110, 100, 116, 139)
             : System.Windows.Media.Color.FromArgb(95, 255, 255, 255));
+
+        foreach (System.Windows.Window win in app.Windows)
+        {
+            win.FontFamily = fontFamily;
+            System.Windows.Documents.TextElement.SetFontFamily(win, fontFamily);
+        }
 
         ThemeChanged?.Invoke();
     }

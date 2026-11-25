@@ -51,6 +51,7 @@ public sealed class ClientSession : IAsyncDisposable
     private double _lastTileSavings;
     private int _activeMonitorIndex;
     private bool _audioEnabled = true;
+    private long _framesReceivedCount;
 
     public SessionTelemetry Telemetry { get; } = new();
     public SessionPermissions GrantedPermissions { get; private set; } = new();
@@ -59,8 +60,11 @@ public sealed class ClientSession : IAsyncDisposable
     public IReadOnlyList<MonitorInfo> Monitors { get; private set; } = [];
     public WriteableBitmap? FrameBitmap => _bitmap;
     public bool IsConnected => _channel?.IsConnected == true;
+    public bool IsAudioEnabled => _audioEnabled;
+    public long FramesReceivedCount => Interlocked.Read(ref _framesReceivedCount);
 
     public event Action<WriteableBitmap>? FrameUpdated;
+    public event Action<int, int>? FrameDimensionsReceived;
     public event Action<IReadOnlyList<MonitorInfo>>? MonitorsUpdated;
     public event Action<SessionTelemetry>? TelemetryUpdated;
     public event Action<FileListResponsePayload>? FileListReceived;
@@ -171,10 +175,10 @@ public sealed class ClientSession : IAsyncDisposable
 
         var chalPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
         if (chalPkt is null || chalPkt.Type != PacketType.AuthRequest)
-            throw new IOException("Missing authentication challenge.");
+            throw new IOException(Services.LocalizationService.T("StatusMissingChallenge"));
 
         var chal = FrameCodec.DeserializeJson<AuthChallengePayload>(chalPkt.Payload)
-            ?? throw new IOException("Invalid authentication challenge.");
+            ?? throw new IOException(Services.LocalizationService.T("StatusInvalidChallenge"));
 
         string? secret = await promptPasswordOrPin(RemoteHostName, chal.AllowUnattended).ConfigureAwait(false);
         AuthMode mode = AuthMode.PinOrConsent;
@@ -182,7 +186,7 @@ public sealed class ClientSession : IAsyncDisposable
 
         if (!string.IsNullOrWhiteSpace(secret))
         {
-            mode = chal.AllowUnattended && secret.Length > 6 ? AuthMode.UnattendedPassword : AuthMode.PinOrConsent;
+            mode = chal.AllowUnattended ? AuthMode.UnattendedPassword : AuthMode.PinOrConsent;
             proof = CryptoSession.ComputeChallengeProof(secret, chal.Salt, chal.NonceChallenge);
         }
 
@@ -192,14 +196,14 @@ public sealed class ClientSession : IAsyncDisposable
         while (true)
         {
             var respPkt = await _channel.ReceivePacketAsync(token).ConfigureAwait(false);
-            if (respPkt is null) throw new IOException("Connection closed before authorization.");
+            if (respPkt is null) throw new IOException(Services.LocalizationService.T("StatusClosedBeforeAuth"));
             if (respPkt.Type != PacketType.AuthResponse) continue;
 
             var resp = FrameCodec.DeserializeJson<AuthResponsePayload>(respPkt.Payload);
-            if (resp is null) throw new IOException("Invalid auth response.");
+            if (resp is null) throw new IOException(Services.LocalizationService.T("StatusInvalidAuthResp"));
             if (resp.PendingConsent)
             {
-                StatusChanged?.Invoke("Waiting for remote user approval...");
+                StatusChanged?.Invoke(Services.LocalizationService.T("StatusWaitingConsent"));
                 continue;
             }
             if (!resp.Accepted)
@@ -209,12 +213,31 @@ public sealed class ClientSession : IAsyncDisposable
             break;
         }
 
+        _audioEnabled = _channel.Mode != ConnectionMode.WssRelay;
         if (GrantedPermissions.AllowAudio && _audioEnabled)
             _audio.StartPlayback();
 
-        StatusChanged?.Invoke($"Connected to {RemoteHostName}");
+        StatusChanged?.Invoke(string.Format(Services.LocalizationService.T("StatusConnectedTo"), RemoteHostName));
         _ = Task.Run(() => ReceiveLoopAsync(token), token);
         _ = Task.Run(() => PingLoopAsync(token), token);
+        _ = Task.Run(() => KeyframeWatchdogAsync(token), token);
+    }
+
+    private async Task KeyframeWatchdogAsync(CancellationToken ct)
+    {
+        try
+        {
+            int[] delaysMs = [800, 1400, 2200];
+            foreach (int d in delaysMs)
+            {
+                await Task.Delay(d, ct).ConfigureAwait(false);
+                if (FramesReceivedCount == 0 && IsConnected)
+                    await SendSystemActionAsync(SystemActionKind.RequestKeyFrame).ConfigureAwait(false);
+                else
+                    break;
+            }
+        }
+        catch { }
     }
 
     private async Task<(ITransportChannel? Channel, SconPacket? HostKey)> ConnectViaInviteCascadeAsync(
@@ -416,7 +439,7 @@ public sealed class ClientSession : IAsyncDisposable
         }
 
         if (paired is null)
-            throw new TimeoutException("Relay pairing timed out.");
+            throw new TimeoutException(Services.LocalizationService.T("StatusRelayTimeout"));
 
         var baseUri = new Uri(relayUrl);
         var builder = new UriBuilder(baseUri)
@@ -432,7 +455,7 @@ public sealed class ClientSession : IAsyncDisposable
 
     private async Task ReceiveLoopAsync(CancellationToken ct)
     {
-        string disconnectReason = "Session closed";
+        string disconnectReason = Services.LocalizationService.T("StatusSessionClosed");
         try
         {
             while (_channel is not null && _channel.IsConnected && !ct.IsCancellationRequested)
@@ -442,6 +465,8 @@ public sealed class ClientSession : IAsyncDisposable
                 {
                     if (pkt?.Payload.Length > 0)
                         disconnectReason = Encoding.UTF8.GetString(pkt.Payload);
+                    else if (_channel is EncryptedTransportChannel enc && !string.IsNullOrWhiteSpace(enc.InnerCloseReason))
+                        disconnectReason = $"{disconnectReason} ({enc.InnerCloseReason})";
                     break;
                 }
 
@@ -462,7 +487,7 @@ public sealed class ClientSession : IAsyncDisposable
                     case PacketType.VideoFrameFull:
                     case PacketType.VideoFrameTiles:
                         var (w, h, rects) = TileDeltaEncoder.DeserializeVideoUpdate(pkt.Payload);
-                        ApplyVideoUpdate(w, h, rects);
+                        Interlocked.Increment(ref _framesReceivedCount);
                         Interlocked.Increment(ref _framesWindow);
                         if (pkt.Type == PacketType.VideoFrameFull) _lastTileSavings = 0;
                         else
@@ -472,6 +497,8 @@ public sealed class ClientSession : IAsyncDisposable
                         }
                         Telemetry.FrameWidth = w;
                         Telemetry.FrameHeight = h;
+                        FrameDimensionsReceived?.Invoke(w, h);
+                        ApplyVideoUpdate(w, h, rects);
                         break;
 
                     case PacketType.AudioFrame:
@@ -586,52 +613,56 @@ public sealed class ClientSession : IAsyncDisposable
         var disp = System.Windows.Application.Current?.Dispatcher;
         if (disp is null) return;
 
-        // Decode JPEG slices into raw BGRA arrays off the UI thread for buttery smooth rendering
-        var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
-        foreach (var r in rects)
+        try
         {
-            using var ms = new MemoryStream(r.JpegBytes);
-            using var bmp = new Bitmap(ms);
-            var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
-            try
+            // Decode JPEG slices into raw BGRA arrays off the UI thread for buttery smooth rendering
+            var decoded = new List<(int X, int Y, int W, int H, int Stride, byte[] Bgra)>(rects.Count);
+            foreach (var r in rects)
             {
-                var px = new byte[bd.Stride * bmp.Height];
-                System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, px, 0, px.Length);
-                decoded.Add((r.X, r.Y, bmp.Width, bmp.Height, bd.Stride, px));
-            }
-            finally
-            {
-                bmp.UnlockBits(bd);
-            }
-        }
-
-        disp.BeginInvoke(() =>
-        {
-            lock (_bmpLock)
-            {
-                if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
-                {
-                    _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
-                }
-
-                _bitmap.Lock();
+                using var ms = new MemoryStream(r.JpegBytes);
+                using var bmp = new Bitmap(ms);
+                var bd = bmp.LockBits(new Rectangle(0, 0, bmp.Width, bmp.Height), ImageLockMode.ReadOnly, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
                 try
                 {
-                    foreach (var d in decoded)
-                    {
-                        int copyW = Math.Min(d.W, frameW - d.X);
-                        int copyH = Math.Min(d.H, frameH - d.Y);
-                        if (copyW <= 0 || copyH <= 0) continue;
-                        _bitmap.WritePixels(new Int32Rect(d.X, d.Y, copyW, copyH), d.Bgra, d.Stride, 0);
-                    }
+                    var px = new byte[bd.Stride * bmp.Height];
+                    System.Runtime.InteropServices.Marshal.Copy(bd.Scan0, px, 0, px.Length);
+                    decoded.Add((r.X, r.Y, bmp.Width, bmp.Height, bd.Stride, px));
                 }
                 finally
                 {
-                    _bitmap.Unlock();
+                    bmp.UnlockBits(bd);
                 }
             }
-            FrameUpdated?.Invoke(_bitmap);
-        });
+
+            disp.BeginInvoke(() =>
+            {
+                lock (_bmpLock)
+                {
+                    if (_bitmap is null || _bitmap.PixelWidth != frameW || _bitmap.PixelHeight != frameH)
+                    {
+                        _bitmap = new WriteableBitmap(frameW, frameH, 96, 96, PixelFormats.Bgra32, null);
+                    }
+
+                    _bitmap.Lock();
+                    try
+                    {
+                        foreach (var d in decoded)
+                        {
+                            int copyW = Math.Min(d.W, frameW - d.X);
+                            int copyH = Math.Min(d.H, frameH - d.Y);
+                            if (copyW <= 0 || copyH <= 0 || d.X < 0 || d.Y < 0) continue;
+                            _bitmap.WritePixels(new Int32Rect(d.X, d.Y, copyW, copyH), d.Bgra, d.Stride, 0);
+                        }
+                    }
+                    finally
+                    {
+                        _bitmap.Unlock();
+                    }
+                }
+                FrameUpdated?.Invoke(_bitmap);
+            });
+        }
+        catch { }
     }
 
     private async Task PingLoopAsync(CancellationToken ct)
@@ -771,6 +802,8 @@ public sealed class ClientSession : IAsyncDisposable
         _audioEnabled = enabled;
         if (enabled && IsConnected && GrantedPermissions.AllowAudio) _audio.StartPlayback();
         else _audio.StopPlayback();
+        if (IsConnected)
+            _ = SendSystemActionAsync(enabled ? SystemActionKind.EnableAudio : SystemActionKind.DisableAudio);
     }
 
     private void OnLocalClipboardChanged(ClipboardPayload payload)

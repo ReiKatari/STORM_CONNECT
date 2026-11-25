@@ -85,7 +85,11 @@ public enum SystemActionKind : byte
     SendWinKey = 5,
     SendAltTab = 6,
     SendPrintScreen = 7,
-    RequestKeyFrame = 8
+    RequestKeyFrame = 8,
+    MoveWindowNextMonitor = 9,
+    MoveWindowPrevMonitor = 10,
+    EnableAudio = 11,
+    DisableAudio = 12
 }
 
 public enum FileOpKind : byte

@@ -42,7 +42,7 @@ public sealed class DxgiScreenCapturer : IDisposable
             var s = screens[i];
             list.Add(new MonitorInfo(
                 i,
-                $"Display {i + 1} ({s.Bounds.Width}x{s.Bounds.Height})",
+                string.Format(Services.LocalizationService.T("MonitorDisplay"), i + 1, s.Bounds.Width, s.Bounds.Height),
                 s.Bounds.X,
                 s.Bounds.Y,
                 s.Bounds.Width,
@@ -55,7 +55,7 @@ public sealed class DxgiScreenCapturer : IDisposable
             var v = SystemInformation.VirtualScreen;
             list.Add(new MonitorInfo(
                 -1,
-                $"All Monitors ({v.Width}x{v.Height})",
+                string.Format(Services.LocalizationService.T("AllMonitors"), v.Width, v.Height),
                 v.X,
                 v.Y,
                 v.Width,

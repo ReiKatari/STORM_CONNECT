@@ -268,7 +268,8 @@ class RemoteSessionClient(
                     break
                 }
 
-                initAudioTrack()
+                audioEnabled = enc.modeLabel != "WssMesh"
+                if (audioEnabled) initAudioTrack()
                 onStatus?.invoke("Connected: $remoteName")
                 launch { pingLoop() }
                 receiveLoop(enc)

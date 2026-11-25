@@ -313,19 +313,21 @@ public sealed class MqttWssClient : IAsyncDisposable
 }
 
 /// <summary>
-/// Full ITransportChannel over MQTT-over-WSS with automatic 28 KB packet chunking & reassembly.
+/// Full ITransportChannel over MQTT-over-WSS with automatic 16 KB packet chunking &amp; reassembly.
 /// </summary>
 public sealed class MqttPipeTransportChannel : ITransportChannel
 {
-    private const int MaxChunkBody = 28 * 1024;
+    private const int MaxChunkBody = 12 * 1024;
     private readonly MqttWssClient _mqtt;
     private readonly string _txTopic;
     private readonly string _rxTopic;
+    private readonly SemaphoreSlim _txLock = new(1, 1);
     private int _nextMsgId;
-    private readonly ConcurrentDictionary<int, (int TotalLen, int ReceivedParts, byte[][] Parts)> _assemblies = new();
+    private readonly ConcurrentDictionary<int, (int TotalLen, int ReceivedParts, byte[][] Parts, DateTime CreatedUtc)> _assemblies = new();
 
     public ConnectionMode Mode => ConnectionMode.WssRelay;
     public bool IsConnected => _mqtt.IsConnected;
+    public string? CloseReason => _mqtt.CloseReason;
 
     public MqttPipeTransportChannel(MqttWssClient mqtt, string sessionToken, bool isInitiator)
     {
@@ -351,21 +353,32 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
         }
 
         var rawFrame = FrameCodec.EncodePlainPacket(type, data, flags);
-        int msgId = Interlocked.Increment(ref _nextMsgId);
         int partCount = Math.Max(1, (rawFrame.Length + MaxChunkBody - 1) / MaxChunkBody);
 
-        for (int p = 0; p < partCount; p++)
+        await _txLock.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            int off = p * MaxChunkBody;
-            int len = Math.Min(MaxChunkBody, rawFrame.Length - off);
-            var chunk = new byte[12 + len];
-            BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(0, 4), msgId);
-            BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), (ushort)p);
-            BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(6, 2), (ushort)partCount);
-            BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(8, 4), rawFrame.Length);
-            Buffer.BlockCopy(rawFrame, off, chunk, 12, len);
+            int msgId = Interlocked.Increment(ref _nextMsgId);
+            for (int p = 0; p < partCount; p++)
+            {
+                if (p > 0)
+                    await Task.Delay(5, ct).ConfigureAwait(false);
 
-            await _mqtt.PublishAsync(_txTopic, chunk, ct).ConfigureAwait(false);
+                int off = p * MaxChunkBody;
+                int len = Math.Min(MaxChunkBody, rawFrame.Length - off);
+                var chunk = new byte[12 + len];
+                BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(0, 4), msgId);
+                BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(4, 2), (ushort)p);
+                BinaryPrimitives.WriteUInt16LittleEndian(chunk.AsSpan(6, 2), (ushort)partCount);
+                BinaryPrimitives.WriteInt32LittleEndian(chunk.AsSpan(8, 4), rawFrame.Length);
+                Buffer.BlockCopy(rawFrame, off, chunk, 12, len);
+
+                await _mqtt.PublishAsync(_txTopic, chunk, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            _txLock.Release();
         }
     }
 
@@ -395,12 +408,19 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
             }
             else
             {
-                var entry = _assemblies.GetOrAdd(msgId, _ => (totalLen, 0, new byte[partCount][]));
+                if (_assemblies.Count > 16)
+                {
+                    var cutoff = DateTime.UtcNow.AddSeconds(-6);
+                    foreach (var kv in _assemblies)
+                        if (kv.Value.CreatedUtc < cutoff) _assemblies.TryRemove(kv.Key, out _);
+                }
+
+                var entry = _assemblies.GetOrAdd(msgId, _ => (totalLen, 0, new byte[partCount][], DateTime.UtcNow));
                 if (entry.Parts[partIdx] is null)
                 {
                     entry.Parts[partIdx] = buf.AsSpan(12).ToArray();
                     int done = entry.ReceivedParts + 1;
-                    entry = (entry.TotalLen, done, entry.Parts);
+                    entry = (entry.TotalLen, done, entry.Parts, entry.CreatedUtc);
                     _assemblies[msgId] = entry;
                     if (done >= partCount)
                     {
@@ -439,5 +459,9 @@ public sealed class MqttPipeTransportChannel : ITransportChannel
         return null;
     }
 
-    public ValueTask DisposeAsync() => _mqtt.DisposeAsync();
+    public ValueTask DisposeAsync()
+    {
+        _txLock.Dispose();
+        return _mqtt.DisposeAsync();
+    }
 }

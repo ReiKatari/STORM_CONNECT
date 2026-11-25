@@ -155,7 +155,56 @@ public static class NativeInputInjector
                 // Windows restricts non-system SAS injection; open Task Manager / Security screen helper
                 Process.Start(new ProcessStartInfo("taskmgr.exe") { UseShellExecute = true });
                 break;
+            case SystemActionKind.MoveWindowNextMonitor:
+                MoveActiveWindowToMonitor(1);
+                break;
+            case SystemActionKind.MoveWindowPrevMonitor:
+                MoveActiveWindowToMonitor(-1);
+                break;
         }
+    }
+
+    public static void MoveActiveWindowToMonitor(int delta)
+    {
+        var screens = Screen.AllScreens;
+        if (screens.Length < 2) return;
+
+        IntPtr hwnd = GetForegroundWindow();
+        if (hwnd == IntPtr.Zero)
+        {
+            SendCombo(0x5B, 0x10, delta >= 0 ? (ushort)0x27 : (ushort)0x25);
+            return;
+        }
+
+        var currentScreen = Screen.FromHandle(hwnd);
+        int curIdx = Array.FindIndex(screens, s => s.DeviceName == currentScreen.DeviceName);
+        if (curIdx < 0) curIdx = 0;
+        int nextIdx = ((curIdx + delta) % screens.Length + screens.Length) % screens.Length;
+
+        var srcArea = screens[curIdx].WorkingArea;
+        var dstArea = screens[nextIdx].WorkingArea;
+
+        bool wasMaximized = IsZoomed(hwnd);
+        if (wasMaximized)
+            ShowWindow(hwnd, 9 /* SW_RESTORE */);
+
+        if (GetWindowRect(hwnd, out var rect))
+        {
+            int curW = Math.Max(200, rect.Right - rect.Left);
+            int curH = Math.Max(150, rect.Bottom - rect.Top);
+            int newW = Math.Min(curW, dstArea.Width);
+            int newH = Math.Min(curH, dstArea.Height);
+
+            double relX = srcArea.Width > 0 ? (double)(rect.Left - srcArea.Left) / srcArea.Width : 0.05;
+            double relY = srcArea.Height > 0 ? (double)(rect.Top - srcArea.Top) / srcArea.Height : 0.05;
+            int newX = Math.Clamp(dstArea.Left + (int)Math.Round(relX * dstArea.Width), dstArea.Left, Math.Max(dstArea.Left, dstArea.Right - newW));
+            int newY = Math.Clamp(dstArea.Top + (int)Math.Round(relY * dstArea.Height), dstArea.Top, Math.Max(dstArea.Top, dstArea.Bottom - newH));
+
+            SetWindowPos(hwnd, IntPtr.Zero, newX, newY, newW, newH, 0x0004 /* SWP_NOZORDER */ | 0x0010 /* SWP_NOACTIVATE */);
+        }
+
+        if (wasMaximized)
+            ShowWindow(hwnd, 3 /* SW_MAXIMIZE */);
     }
 
     private static void SendCombo(params ushort[] vks)
@@ -192,6 +241,24 @@ public static class NativeInputInjector
 
     [DllImport("user32.dll")]
     private static extern bool LockWorkStation();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    private static extern bool IsZoomed(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct INPUT

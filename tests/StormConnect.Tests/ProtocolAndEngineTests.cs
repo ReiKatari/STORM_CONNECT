@@ -374,4 +374,122 @@ public sealed class ProtocolAndEngineTests
         await Task.Delay(2200);
         Assert.True(client.IsConnected);
     }
+
+    [Fact]
+    public async Task EndToEnd_PublicMqttWss_StreamsRealVideoFramesAndKeepsAlive()
+    {
+        string hostId = RandomNumberGenerator.GetInt32(830_000_000, 899_999_999).ToString();
+        string clientId = RandomNumberGenerator.GetInt32(730_000_000, 799_999_999).ToString();
+        const string pin = "991122";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        var diagLogs = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        host.AuditLogEvent += m => diagLogs.Enqueue($"[HOST] {m}");
+
+        host.Start(0, "", enableRelay: true);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!host.IsRelayConnected && sw.ElapsedMilliseconds < 10000) await Task.Delay(100);
+        Assert.True(host.IsRelayConnected);
+
+        await using var client = new ClientSession(clientId, clientClip);
+        client.StatusChanged += m => diagLogs.Enqueue($"[CL-ST] {m}");
+        client.Disconnected += r => diagLogs.Enqueue($"[CL-DC] {r}");
+        var frameTcs = new TaskCompletionSource<(int W, int H)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.FrameDimensionsReceived += (w, h) => frameTcs.TrySetResult((w, h));
+
+        await client.ConnectAsync(hostId, "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin), preferredMethodIndex: 3);
+        Assert.True(client.IsConnected);
+
+        var (fw, fh) = await frameTcs.Task.WaitAsync(TimeSpan.FromSeconds(12))
+            .ContinueWith(t => t.IsCompletedSuccessfully
+                ? t.Result
+                : throw new TimeoutException($"Frame timeout! Logs: {string.Join(" | ", diagLogs)} ; RxBytes={client.Telemetry.TotalBytesReceived} ; Connected={client.IsConnected}"));
+        Assert.True(fw > 0 && fh > 0, $"Invalid frame size {fw}x{fh}");
+        Assert.True(client.FramesReceivedCount >= 1);
+
+        // Ensure connection stays stable after streaming video frames & concurrent file listing
+        var filesTcs = new TaskCompletionSource<FileListResponsePayload>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.FileListReceived += f => filesTcs.TrySetResult(f);
+        await client.RequestFileListAsync("");
+        var files = await filesTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.NotEmpty(files.Entries);
+        await Task.Delay(1500);
+        Assert.True(client.IsConnected);
+    }
+
+    [Fact]
+    public void CryptoSession_SlidingWindow_AcceptsMinorOutOfOrderAndRejectsReplay()
+    {
+        using var tx = new CryptoSession();
+        using var rx = new CryptoSession();
+        tx.DeriveKeys(rx.LocalPublicKeyUncompressed, isInitiator: true);
+        rx.DeriveKeys(tx.LocalPublicKeyUncompressed, isInitiator: false);
+
+        var c1 = tx.Encrypt(Encoding.UTF8.GetBytes("pkt-1"));
+        var c2 = tx.Encrypt(Encoding.UTF8.GetBytes("pkt-2"));
+        var c3 = tx.Encrypt(Encoding.UTF8.GetBytes("pkt-3"));
+
+        Assert.Equal("pkt-1", Encoding.UTF8.GetString(rx.Decrypt(c1)));
+        Assert.Equal("pkt-3", Encoding.UTF8.GetString(rx.Decrypt(c3)));
+        Assert.Equal("pkt-2", Encoding.UTF8.GetString(rx.Decrypt(c2)));
+
+        // Duplicate replays must be rejected
+        Assert.ThrowsAny<CryptographicException>(() => rx.Decrypt(c2));
+        Assert.ThrowsAny<CryptographicException>(() => rx.Decrypt(c3));
+    }
+
+    [Fact]
+    public void TileDeltaEncoder_DownscalesOversizedFrameForMesh()
+    {
+        int w = 1920, h = 1080;
+        var buf = new byte[w * h * 4];
+        for (int i = 0; i < buf.Length; i += 4) { buf[i] = 30; buf[i + 1] = 60; buf[i + 2] = 120; buf[i + 3] = 255; }
+        var frame = new CapturedFrame { Width = w, Height = h, Stride = w * 4, BgraPixels = buf };
+        var enc = new TileDeltaEncoder();
+        var update = enc.Encode(frame, 55, forceFullFrame: true, maxWidth: 1280);
+        Assert.NotNull(update);
+        Assert.Equal(1280, update!.FrameWidth);
+        Assert.Equal(720, update.FrameHeight);
+        Assert.True(update.Rects[0].JpegBytes.Length < 120 * 1024);
+    }
+
+    [Fact]
+    public void SettingsStore_SavedConnectionAndUnattendedToggle_Works()
+    {
+        var store = new SettingsStore();
+        var enc = SettingsStore.ProtectSecret("StormSecret123!");
+        Assert.NotNull(enc);
+        Assert.Equal("StormSecret123!", SettingsStore.UnprotectSecret(enc));
+
+        store.SetUnattendedPassword("HostPass99");
+        Assert.True(store.Current.EnableUnattendedPassword);
+        var (h1, s1) = store.GetUnattendedCredentials();
+        Assert.NotNull(h1);
+        Assert.NotNull(s1);
+
+        store.Current.EnableUnattendedPassword = false;
+        var (h2, s2) = store.GetUnattendedCredentials();
+        Assert.Null(h2);
+        Assert.Null(s2);
+
+        store.SetUnattendedPassword(null);
+    }
+
+    [Fact]
+    public void ThemeService_Fonts_TenDistinctFamiliesAndNoMissingNames()
+    {
+        Assert.Equal(10, ThemeService.Fonts.Count);
+        var distinct = ThemeService.Fonts.Select(f => f.WpfFamily).Distinct(StringComparer.OrdinalIgnoreCase).Count();
+        Assert.Equal(10, distinct);
+    }
 }

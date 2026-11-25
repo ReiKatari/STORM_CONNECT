@@ -101,7 +101,7 @@ public sealed class LiveChartControl : Canvas
                 Padding = new Thickness(8, 4, 8, 4),
                 Child = new TextBlock
                 {
-                    Text = $"{fpsArr[idx]:0.#} FPS  |  {mbpsArr[idx]:0.##} Mbps",
+                    Text = $"{fpsArr[idx]:0.#} {Services.LocalizationService.T("LabelFps")}  |  {mbpsArr[idx]:0.##} {Services.LocalizationService.T("UnitMbps")}",
                     Foreground = TryFindResource("ThemeTextPrimary") as Brush ?? Brushes.White,
                     FontSize = 11,
                     FontWeight = FontWeights.SemiBold

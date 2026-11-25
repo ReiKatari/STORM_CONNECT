@@ -345,7 +345,7 @@ public sealed class HostServer : IAsyncDisposable
         {
             if (!_getAllowIncoming())
             {
-                await rawChannel.SendPacketAsync(PacketType.Disconnect, Encoding.UTF8.GetBytes("Incoming connections disabled"), ct: ct);
+                await rawChannel.SendPacketAsync(PacketType.Disconnect, Encoding.UTF8.GetBytes(Services.LocalizationService.T("StatusIncomingDisabled")), ct: ct);
                 return;
             }
 
@@ -373,7 +373,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.2.1", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.3.0", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -395,14 +395,17 @@ public sealed class HostServer : IAsyncDisposable
             var perms = _getDefaultPermissions().Clone();
             bool authorized = false;
 
-            if (authReq.Mode == AuthMode.UnattendedPassword && !string.IsNullOrWhiteSpace(unattHash))
+            if (!string.IsNullOrWhiteSpace(authReq.PinOrPasswordProof))
             {
-                authorized = CryptoSession.VerifyChallengeProof(unattHash, challengeNonce, authReq.PinOrPasswordProof);
-            }
-            else if (!string.IsNullOrWhiteSpace(authReq.PinOrPasswordProof))
-            {
-                var pinHash = CryptoSession.HashPassword(_getPin(), challenge.Salt);
-                authorized = CryptoSession.VerifyChallengeProof(pinHash, challengeNonce, authReq.PinOrPasswordProof);
+                if (!string.IsNullOrWhiteSpace(unattHash))
+                {
+                    authorized = CryptoSession.VerifyChallengeProof(unattHash, challengeNonce, authReq.PinOrPasswordProof);
+                }
+                if (!authorized)
+                {
+                    var pinHash = CryptoSession.HashPassword(_getPin(), challenge.Salt);
+                    authorized = CryptoSession.VerifyChallengeProof(pinHash, challengeNonce, authReq.PinOrPasswordProof);
+                }
             }
 
             if (!authorized)
@@ -410,7 +413,7 @@ public sealed class HostServer : IAsyncDisposable
                 // Ask local user via Consent Modal
                 await channel.SendPacketAsync(
                     PacketType.AuthResponse,
-                    FrameCodec.SerializeJson(new AuthResponsePayload(false, true, "Waiting for host approval...", perms)),
+                    FrameCodec.SerializeJson(new AuthResponsePayload(false, true, Services.LocalizationService.T("StatusWaitingConsent"), perms)),
                     ct: ct).ConfigureAwait(false);
 
                 var decision = await _consentPrompt(new IncomingConsentRequest(
@@ -424,7 +427,7 @@ public sealed class HostServer : IAsyncDisposable
                 {
                     await channel.SendPacketAsync(
                         PacketType.AuthResponse,
-                        FrameCodec.SerializeJson(new AuthResponsePayload(false, false, "Declined by host user.", perms)),
+                        FrameCodec.SerializeJson(new AuthResponsePayload(false, false, Services.LocalizationService.T("StatusDeclinedByHost"), perms)),
                         ct: ct).ConfigureAwait(false);
                     return;
                 }
@@ -433,7 +436,7 @@ public sealed class HostServer : IAsyncDisposable
 
             await channel.SendPacketAsync(
                 PacketType.AuthResponse,
-                FrameCodec.SerializeJson(new AuthResponsePayload(true, false, "Connected", perms)),
+                FrameCodec.SerializeJson(new AuthResponsePayload(true, false, Services.LocalizationService.T("StatusConnectedSimple"), perms)),
                 ct: ct).ConfigureAwait(false);
 
             var ctx = new HostSessionContext
@@ -479,21 +482,24 @@ public sealed class HostServer : IAsyncDisposable
         var encoder = new TileDeltaEncoder();
         using var audio = new AudioStreamer();
 
-        if (ctx.Permissions.AllowAudio)
+        audio.AudioFrameCaptured += async pcm =>
         {
-            audio.AudioFrameCaptured += async pcm =>
+            if (ctx.Permissions.AllowAudio && channel.IsConnected)
             {
-                if (ctx.Permissions.AllowAudio && channel.IsConnected)
-                {
-                    try { await channel.SendPacketAsync(PacketType.AudioFrame, pcm, compress: true, ct).ConfigureAwait(false); } catch { }
-                }
-            };
+                try { await channel.SendPacketAsync(PacketType.AudioFrame, pcm, compress: true, ct).ConfigureAwait(false); } catch { }
+            }
+        };
+
+        // Do not auto-stream 25 pkt/s PCM audio over public WSS MQTT mesh unless client explicitly toggles Audio ON
+        if (ctx.Permissions.AllowAudio && channel.Mode != ConnectionMode.WssRelay)
+        {
             audio.StartCapture();
         }
 
         var activeUploads = new ConcurrentDictionary<string, (FileStream Stream, long TotalBytes, long Received, string Path, string ExpectedSha)>();
 
         // Video streaming loop
+        bool firstRelayFrame = channel.Mode == ConnectionMode.WssRelay;
         var videoTask = Task.Run(async () =>
         {
             while (!ct.IsCancellationRequested && channel.IsConnected)
@@ -501,12 +507,19 @@ public sealed class HostServer : IAsyncDisposable
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 try
                 {
-                    var frame = capturer.Capture(Volatile.Read(ref activeMonitor));
+                    int mon = Volatile.Read(ref activeMonitor);
+                    var frame = capturer.Capture(mon);
                     if (frame is not null)
                     {
                         bool key = forceKeyFrame;
                         forceKeyFrame = false;
-                        var update = encoder.Encode(frame, targetQuality, key);
+                        bool ultraFastFirst = key && firstRelayFrame;
+                        firstRelayFrame = false;
+                        int encQuality = ultraFastFirst ? Math.Min(45, targetQuality) : targetQuality;
+                        int maxWidth = channel.Mode == ConnectionMode.WssRelay
+                            ? (ultraFastFirst ? 1024 : (mon == -1 ? 1600 : 1280))
+                            : 0;
+                        var update = encoder.Encode(frame, encQuality, key, maxWidth);
                         if (update is not null)
                         {
                             var bytes = TileDeltaEncoder.SerializeVideoUpdate(update);
@@ -519,10 +532,14 @@ public sealed class HostServer : IAsyncDisposable
                     }
                 }
                 catch (OperationCanceledException) { break; }
-                catch { break; }
+                catch (Exception ex)
+                {
+                    AuditLogEvent?.Invoke($"Video send loop ended: {ex.Message}");
+                    if (!channel.IsConnected) break;
+                }
 
                 int elapsed = (int)sw.ElapsedMilliseconds;
-                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 85 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
+                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 110 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
                 if (elapsed < targetInterval)
                 {
                     try { await Task.Delay(targetInterval - elapsed, ct).ConfigureAwait(false); }
@@ -583,6 +600,18 @@ public sealed class HostServer : IAsyncDisposable
                             if (action == SystemActionKind.RequestKeyFrame)
                             {
                                 forceKeyFrame = true;
+                            }
+                            else if (action == SystemActionKind.EnableAudio && ctx.Permissions.AllowAudio)
+                            {
+                                audio.StartCapture();
+                            }
+                            else if (action == SystemActionKind.DisableAudio)
+                            {
+                                audio.StopCapture();
+                            }
+                            else if (action is SystemActionKind.MoveWindowNextMonitor or SystemActionKind.MoveWindowPrevMonitor && ctx.Permissions.AllowControl)
+                            {
+                                NativeInputInjector.ExecuteSystemAction(action);
                             }
                             else if (ctx.Permissions.AllowSystemActions)
                             {

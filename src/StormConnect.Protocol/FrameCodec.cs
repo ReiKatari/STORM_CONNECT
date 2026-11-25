@@ -264,9 +264,11 @@ public sealed class EncryptedTransportChannel : ITransportChannel
 {
     private readonly ITransportChannel _inner;
     private readonly CryptoSession _crypto;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
 
     public ConnectionMode Mode => _inner.Mode;
     public bool IsConnected => _inner.IsConnected;
+    public string? InnerCloseReason => (_inner as MqttPipeTransportChannel)?.CloseReason;
 
     public EncryptedTransportChannel(ITransportChannel inner, CryptoSession crypto)
     {
@@ -274,7 +276,7 @@ public sealed class EncryptedTransportChannel : ITransportChannel
         _crypto = crypto;
     }
 
-    public Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
+    public async Task SendPacketAsync(PacketType type, ReadOnlyMemory<byte> payload, bool compress = false, CancellationToken ct = default)
     {
         // Pack [1B InnerType][1B InnerFlags][Payload] inside encrypted envelope
         byte innerFlags = 0;
@@ -294,8 +296,16 @@ public sealed class EncryptedTransportChannel : ITransportChannel
         plainEnvelope[1] = innerFlags;
         Buffer.BlockCopy(body, 0, plainEnvelope, 2, body.Length);
 
-        var cipher = _crypto.Encrypt(plainEnvelope);
-        return _inner.SendPacketAsync(type, cipher, compress: false, ct);
+        await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            var cipher = _crypto.Encrypt(plainEnvelope);
+            await _inner.SendPacketAsync(type, cipher, compress: false, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _sendLock.Release();
+        }
     }
 
     public async Task<SconPacket?> ReceivePacketAsync(CancellationToken ct = default)
@@ -320,9 +330,10 @@ public sealed class EncryptedTransportChannel : ITransportChannel
         return new SconPacket(innerType, innerFlags, payload);
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
+        _sendLock.Dispose();
         _crypto.Dispose();
-        return _inner.DisposeAsync();
+        await _inner.DisposeAsync().ConfigureAwait(false);
     }
 }

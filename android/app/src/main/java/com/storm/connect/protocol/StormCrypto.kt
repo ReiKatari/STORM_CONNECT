@@ -34,7 +34,8 @@ class StormCrypto {
     private var txKey: ByteArray? = null
     private var rxKey: ByteArray? = null
     private var txCounter: Long = 0
-    private var rxCounter: Long = 0
+    private var rxMaxSeq: Long = 0
+    private var rxWindowMask: Long = 0L
     private var txSaltPrefix = ByteArray(4)
     private var rxSaltPrefix = ByteArray(4)
     private val txLock = Any()
@@ -104,7 +105,11 @@ class StormCrypto {
         require(frame.size >= 24) { "Encrypted frame too short" }
 
         val seq = ByteBuffer.wrap(frame, 0, 8).order(ByteOrder.BIG_ENDIAN).long
-        require(seq > rxCounter) { "Replay detected" }
+        require(seq > 0) { "Invalid sequence" }
+        if (seq <= rxMaxSeq) {
+            val diff = rxMaxSeq - seq
+            require(diff < 64 && (rxWindowMask and (1L shl diff.toInt())) == 0L) { "Replay detected" }
+        }
 
         val nonce = ByteArray(12)
         System.arraycopy(rxSaltPrefix, 0, nonce, 0, 4)
@@ -118,7 +123,14 @@ class StormCrypto {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(128, nonce))
         val plain = cipher.doFinal(ctAndTag)
-        rxCounter = seq
+        if (seq > rxMaxSeq) {
+            val shift = seq - rxMaxSeq
+            rxWindowMask = if (shift >= 64) 1L else ((rxWindowMask shl shift.toInt()) or 1L)
+            rxMaxSeq = seq
+        } else {
+            val diff = (rxMaxSeq - seq).toInt()
+            rxWindowMask = rxWindowMask or (1L shl diff)
+        }
         return plain
     }
 

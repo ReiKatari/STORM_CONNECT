@@ -565,8 +565,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun checkAndroidUpdates() {
         val installedVer = runCatching {
-            packageManager.getPackageInfo(packageName, 0).versionName ?: "1.1.0"
-        }.getOrDefault("1.1.0")
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "1.3.0"
+        }.getOrDefault("1.3.0")
         CoroutineScope(Dispatchers.IO).launch {
             runCatching {
                 val url = URL("https://stormgamesworld.ru/api/programs/releases?repo=STORM_CONNECT&latest=1")

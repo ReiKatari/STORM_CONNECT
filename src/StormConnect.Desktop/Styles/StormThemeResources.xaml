@@ -22,7 +22,7 @@
         <GradientStop Color="#8B5CF6" Offset="0"/>
         <GradientStop Color="#06B6D4" Offset="1"/>
     </LinearGradientBrush>
-    <FontFamily x:Key="ThemeFontFamily">Inter, Segoe UI, Arial</FontFamily>
+    <FontFamily x:Key="ThemeFontFamily">Segoe UI</FontFamily>
 
     <!-- Global Base Typography -->
     <Style TargetType="{x:Type TextBlock}">

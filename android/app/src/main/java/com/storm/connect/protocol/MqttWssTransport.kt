@@ -224,10 +224,11 @@ class MqttPipeTransportChannel(
         } else payload
         val rawFrame = FrameCodec.encodePlain(type, data, flags)
         val msgId = nextMsgId++
-        val maxBody = 28 * 1024
+        val maxBody = 16 * 1024
         val partCount = maxOf(1, (rawFrame.size + maxBody - 1) / maxBody)
 
         for (p in 0 until partCount) {
+            if (p > 0) kotlinx.coroutines.delay(3)
             val off = p * maxBody
             val len = minOf(maxBody, rawFrame.size - off)
             val chunk = ByteArray(12 + len)

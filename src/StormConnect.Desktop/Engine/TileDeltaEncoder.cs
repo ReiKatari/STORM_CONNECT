@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
@@ -36,8 +37,13 @@ public sealed class TileDeltaEncoder
         _prevHeight = 0;
     }
 
-    public EncodedVideoUpdate? Encode(CapturedFrame frame, int jpegQuality, bool forceFullFrame = false)
+    public EncodedVideoUpdate? Encode(CapturedFrame frame, int jpegQuality, bool forceFullFrame = false, int maxWidth = 0)
     {
+        if (maxWidth > 0 && frame.Width > maxWidth)
+        {
+            frame = DownscaleFrame(frame, maxWidth);
+        }
+
         int w = frame.Width;
         int h = frame.Height;
         int tile = ProtocolConstants.TileSize;
@@ -230,6 +236,55 @@ public sealed class TileDeltaEncoder
             regionBmp.Save(ms, ImageFormat.Jpeg);
         }
         return ms.ToArray();
+    }
+
+    private static CapturedFrame DownscaleFrame(CapturedFrame src, int maxWidth)
+    {
+        int dstW = Math.Max(64, maxWidth & ~1);
+        int dstH = Math.Max(64, ((int)Math.Round(src.Height * ((double)dstW / src.Width))) & ~1);
+
+        using var srcBmp = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb);
+        var srcData = srcBmp.LockBits(new Rectangle(0, 0, src.Width, src.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int copyBytes = Math.Min(src.BgraPixels.Length, Math.Abs(srcData.Stride) * src.Height);
+            Marshal.Copy(src.BgraPixels, 0, srcData.Scan0, copyBytes);
+        }
+        finally
+        {
+            srcBmp.UnlockBits(srcData);
+        }
+
+        using var dstBmp = new Bitmap(dstW, dstH, PixelFormat.Format32bppArgb);
+        using (var g = Graphics.FromImage(dstBmp))
+        {
+            g.InterpolationMode = InterpolationMode.Bilinear;
+            g.CompositingQuality = CompositingQuality.HighSpeed;
+            g.PixelOffsetMode = PixelOffsetMode.HighSpeed;
+            g.DrawImage(srcBmp, new Rectangle(0, 0, dstW, dstH), new Rectangle(0, 0, src.Width, src.Height), GraphicsUnit.Pixel);
+        }
+
+        var dstData = dstBmp.LockBits(new Rectangle(0, 0, dstW, dstH), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        try
+        {
+            int len = dstData.Stride * dstH;
+            var outPx = new byte[len];
+            Marshal.Copy(dstData.Scan0, outPx, 0, len);
+            return new CapturedFrame
+            {
+                Width = dstW,
+                Height = dstH,
+                Stride = dstData.Stride,
+                BgraPixels = outPx,
+                CursorX = (int)Math.Round(src.CursorX * ((double)dstW / src.Width)),
+                CursorY = (int)Math.Round(src.CursorY * ((double)dstH / src.Height)),
+                CursorVisible = src.CursorVisible
+            };
+        }
+        finally
+        {
+            dstBmp.UnlockBits(dstData);
+        }
     }
 
     private static unsafe void CopyBgraToBgrRow(byte[] src, int srcOffset, IntPtr dstPtr, int pixelCount)

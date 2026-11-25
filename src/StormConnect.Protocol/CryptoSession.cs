@@ -14,7 +14,8 @@ public sealed class CryptoSession : IDisposable
     private byte[]? _txKey;
     private byte[]? _rxKey;
     private long _txCounter;
-    private long _rxCounter;
+    private long _rxMaxSeq;
+    private ulong _rxWindowMask;
     private readonly byte[] _txSaltPrefix = new byte[4];
     private readonly byte[] _rxSaltPrefix = new byte[4];
     private readonly object _txLock = new();
@@ -95,8 +96,15 @@ public sealed class CryptoSession : IDisposable
         lock (_rxLock)
         {
             long seq = BinaryPrimitives.ReadInt64BigEndian(encryptedFrame[..8]);
-            if (seq <= _rxCounter)
-                throw new CryptographicException("Replay or out-of-order sequence detected.");
+            if (seq <= 0)
+                throw new CryptographicException("Invalid encrypted sequence number.");
+
+            if (seq <= _rxMaxSeq)
+            {
+                long diff = _rxMaxSeq - seq;
+                if (diff >= 64 || (_rxWindowMask & (1UL << (int)diff)) != 0)
+                    throw new CryptographicException("Replay or out-of-window sequence detected.");
+            }
 
             Span<byte> nonce = stackalloc byte[12];
             _rxSaltPrefix.CopyTo(nonce);
@@ -108,7 +116,18 @@ public sealed class CryptoSession : IDisposable
 
             using var aes = new AesGcm(_rxKey, 16);
             aes.Decrypt(nonce, ciphertext, tag, plaintext);
-            _rxCounter = seq;
+
+            if (seq > _rxMaxSeq)
+            {
+                long shift = seq - _rxMaxSeq;
+                _rxWindowMask = shift >= 64 ? 1UL : ((_rxWindowMask << (int)shift) | 1UL);
+                _rxMaxSeq = seq;
+            }
+            else
+            {
+                long diff = _rxMaxSeq - seq;
+                _rxWindowMask |= (1UL << (int)diff);
+            }
             return plaintext;
         }
     }

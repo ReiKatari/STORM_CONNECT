@@ -13,10 +13,12 @@ public sealed class AddressBookEntry
     public string Alias { get; set; } = string.Empty;
     public string HostOrIp { get; set; } = string.Empty;
     public string MacAddress { get; set; } = string.Empty;
-    public string Group { get; set; } = "Workstations";
+    public string Group { get; set; } = string.Empty;
     public bool IsFavorite { get; set; }
     public string Notes { get; set; } = string.Empty;
     public DateTime? LastConnectedUtc { get; set; }
+    public string? SavedPasswordProtectedBase64 { get; set; }
+    public bool AutoLoginWithPassword { get; set; } = true;
 }
 
 public sealed class AuditLogEntry
@@ -33,10 +35,11 @@ public sealed class AppSettings
     public string Language { get; set; } = "auto";
     public string Theme { get; set; } = "MIDNIGHT";
     public string Accent { get; set; } = "Violet";
-    public string FontFamily { get; set; } = "Inter";
+    public string FontFamily { get; set; } = "Segoe UI";
     public double UiScale { get; set; } = 1.0;
 
     public bool AllowIncoming { get; set; } = true;
+    public bool EnableUnattendedPassword { get; set; } = true;
     public bool DefaultAllowControl { get; set; } = true;
     public bool DefaultAllowClipboard { get; set; } = true;
     public bool DefaultAllowFileTransfer { get; set; } = true;
@@ -112,7 +115,17 @@ public sealed class SettingsStore
         {
             Current.StormId = DeviceIdentity.NormalizeId(Current.StormId);
         }
+
+        if (!ThemeService.Fonts.Any(f => string.Equals(f.DisplayName, Current.FontFamily, StringComparison.OrdinalIgnoreCase)))
+        {
+            Current.FontFamily = ThemeService.Fonts[0].DisplayName;
+            Save();
+        }
     }
+
+    public bool HasUnattendedPassword =>
+        !string.IsNullOrWhiteSpace(Current.UnattendedPasswordHash) &&
+        !string.IsNullOrWhiteSpace(Current.UnattendedSaltBase64);
 
     public void Save()
     {
@@ -131,34 +144,101 @@ public sealed class SettingsStore
             Current.UnattendedPasswordHash = null;
             Current.UnattendedSaltBase64 = null;
             Current.UnattendedProtectedRawBase64 = null;
+            Current.EnableUnattendedPassword = false;
         }
         else
         {
             var salt = RandomNumberGenerator.GetBytes(16);
             Current.UnattendedSaltBase64 = Convert.ToBase64String(salt);
             Current.UnattendedPasswordHash = CryptoSession.HashPassword(plainPassword, salt);
-            try
-            {
-                var protectedBytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(plainPassword), null, DataProtectionScope.CurrentUser);
-                Current.UnattendedProtectedRawBase64 = Convert.ToBase64String(protectedBytes);
-            }
-            catch { }
+            Current.EnableUnattendedPassword = true;
+            Current.UnattendedProtectedRawBase64 = ProtectSecret(plainPassword);
         }
         Save();
     }
 
     public (string? Hash, byte[]? Salt) GetUnattendedCredentials()
     {
-        if (string.IsNullOrWhiteSpace(Current.UnattendedPasswordHash) || string.IsNullOrWhiteSpace(Current.UnattendedSaltBase64))
+        if (!Current.EnableUnattendedPassword || !HasUnattendedPassword)
             return (null, null);
         try
         {
-            return (Current.UnattendedPasswordHash, Convert.FromBase64String(Current.UnattendedSaltBase64));
+            return (Current.UnattendedPasswordHash, Convert.FromBase64String(Current.UnattendedSaltBase64!));
         }
         catch
         {
             return (null, null);
         }
+    }
+
+    public static string? ProtectSecret(string? plain)
+    {
+        if (string.IsNullOrWhiteSpace(plain)) return null;
+        try
+        {
+            var protectedBytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(plain), null, DataProtectionScope.CurrentUser);
+            return Convert.ToBase64String(protectedBytes);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static string? UnprotectSecret(string? protectedBase64)
+    {
+        if (string.IsNullOrWhiteSpace(protectedBase64)) return null;
+        try
+        {
+            var raw = ProtectedData.Unprotect(Convert.FromBase64String(protectedBase64), null, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(raw);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public AddressBookEntry? FindAddressBookEntry(string target)
+    {
+        string trimmed = target.Trim();
+        string norm = DeviceIdentity.NormalizeId(trimmed);
+        return Current.AddressBook.FirstOrDefault(x =>
+            (norm.Length == 9 && DeviceIdentity.NormalizeId(x.StormId) == norm) ||
+            (!string.IsNullOrWhiteSpace(x.HostOrIp) && string.Equals(x.HostOrIp.Trim(), trimmed, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    public void UpsertSavedConnection(string target, string? alias, string? plainPassword, string? stormIdOverride = null)
+    {
+        string norm = DeviceIdentity.NormalizeId(stormIdOverride ?? target);
+        string hostOrIp = norm.Length == 9 ? string.Empty : target.Trim();
+        var existing = FindAddressBookEntry(norm.Length == 9 ? norm : target);
+        if (existing is null)
+        {
+            existing = new AddressBookEntry
+            {
+                StormId = norm.Length == 9 ? norm : string.Empty,
+                HostOrIp = hostOrIp,
+                Alias = string.IsNullOrWhiteSpace(alias)
+                    ? (norm.Length == 9 ? DeviceIdentity.FormatId(norm) : target.Trim())
+                    : alias.Trim(),
+                Group = string.Empty
+            };
+            Current.AddressBook.Insert(0, existing);
+        }
+        else
+        {
+            if (norm.Length == 9) existing.StormId = norm;
+            if (!string.IsNullOrWhiteSpace(alias)) existing.Alias = alias.Trim();
+        }
+
+        if (!string.IsNullOrWhiteSpace(plainPassword))
+        {
+            existing.SavedPasswordProtectedBase64 = ProtectSecret(plainPassword);
+            existing.AutoLoginWithPassword = true;
+        }
+        existing.LastConnectedUtc = DateTime.UtcNow;
+        Save();
     }
 
     public void AddAudit(string peer, string mode, string action)
