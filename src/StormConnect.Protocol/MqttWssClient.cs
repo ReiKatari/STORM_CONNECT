@@ -9,7 +9,7 @@ namespace StormConnect.Protocol;
 
 /// <summary>
 /// Minimal, zero-dependency RFC-compliant MQTT 3.1.1 client over WebSocket (Sec-WebSocket-Protocol: mqtt)
-/// used as a built-in zero-server relay mesh carrying ONLY E2E-encrypted SCON frames.
+/// with strict per-PacketId SUBACK awaiting and 28 KB broker-safe chunking.
 /// </summary>
 public sealed class MqttWssClient : IAsyncDisposable
 {
@@ -18,13 +18,14 @@ public sealed class MqttWssClient : IAsyncDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly Channel<(string Topic, byte[] Payload)> _rxMessages = Channel.CreateUnbounded<(string, byte[])>();
     private readonly TaskCompletionSource _connAckTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly TaskCompletionSource _subAckTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private ushort _nextPacketId = 1;
+    private readonly ConcurrentDictionary<ushort, TaskCompletionSource> _pendingSubAcks = new();
+    private int _nextPacketId = 1;
     private Task? _rxTask;
     private Task? _pingTask;
 
     public bool IsConnected => _ws.State == WebSocketState.Open;
     public string BrokerUrl { get; private set; } = string.Empty;
+    public string? CloseReason { get; private set; }
 
     public async Task ConnectAsync(string brokerUrl, string clientId, CancellationToken ct = default)
     {
@@ -47,10 +48,24 @@ public sealed class MqttWssClient : IAsyncDisposable
 
     public async Task SubscribeAsync(string topic, CancellationToken ct = default)
     {
-        ushort pid = _nextPacketId++;
-        if (_nextPacketId == 0) _nextPacketId = 1;
-        var pkt = BuildSubscribePacket(pid, topic);
-        await SendRawAsync(pkt, ct).ConfigureAwait(false);
+        int raw = Interlocked.Increment(ref _nextPacketId);
+        ushort pid = (ushort)((raw % 65000) + 1);
+        var subTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _pendingSubAcks[pid] = subTcs;
+
+        try
+        {
+            var pkt = BuildSubscribePacket(pid, topic);
+            await SendRawAsync(pkt, ct).ConfigureAwait(false);
+
+            using var waitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            waitCts.CancelAfter(TimeSpan.FromSeconds(5));
+            await subTcs.Task.WaitAsync(waitCts.Token).ConfigureAwait(false);
+        }
+        finally
+        {
+            _pendingSubAcks.TryRemove(pid, out _);
+        }
     }
 
     public Task PublishAsync(string topic, ReadOnlySpan<byte> payload, CancellationToken ct = default)
@@ -111,16 +126,18 @@ public sealed class MqttWssClient : IAsyncDisposable
             while (!ct.IsCancellationRequested && _ws.State == WebSocketState.Open)
             {
                 var res = await _ws.ReceiveAsync(chunk.AsMemory(), ct).ConfigureAwait(false);
-                if (res.MessageType == WebSocketMessageType.Close) break;
+                if (res.MessageType == WebSocketMessageType.Close)
+                {
+                    CloseReason = $"WS Closed ({_ws.CloseStatus}: {_ws.CloseStatusDescription})";
+                    break;
+                }
 
                 if (res.Count > 0)
                 {
-                    long prevLen = streamBuf.Length;
-                    streamBuf.Position = prevLen;
+                    streamBuf.Position = streamBuf.Length;
                     streamBuf.Write(chunk, 0, res.Count);
                 }
 
-                // Parse all complete MQTT packets currently in streamBuf
                 while (TryParseNextMqttPacket(streamBuf, ref readPos, out byte hdr, out byte[] body))
                 {
                     byte pktType = (byte)(hdr >> 4);
@@ -128,10 +145,15 @@ public sealed class MqttWssClient : IAsyncDisposable
                     {
                         case 2: // CONNACK
                             if (body.Length >= 2 && body[1] == 0) _connAckTcs.TrySetResult();
-                            else _connAckTcs.TrySetException(new InvalidOperationException("MQTT CONNACK rejected."));
+                            else _connAckTcs.TrySetException(new InvalidOperationException($"MQTT CONNACK rejected ({(body.Length >= 2 ? body[1] : -1)})."));
                             break;
                         case 9: // SUBACK
-                            _subAckTcs.TrySetResult();
+                            if (body.Length >= 2)
+                            {
+                                ushort pid = BinaryPrimitives.ReadUInt16BigEndian(body.AsSpan(0, 2));
+                                if (_pendingSubAcks.TryRemove(pid, out var tcs))
+                                    tcs.TrySetResult();
+                            }
                             break;
                         case 3: // PUBLISH
                             if (TryDecodePublish(hdr, body, out var topic, out var msgPayload))
@@ -140,7 +162,6 @@ public sealed class MqttWssClient : IAsyncDisposable
                     }
                 }
 
-                // Compact buffer when consumed
                 if (readPos > 0)
                 {
                     int rem = (int)(streamBuf.Length - readPos);
@@ -158,11 +179,16 @@ public sealed class MqttWssClient : IAsyncDisposable
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            CloseReason ??= ex.Message;
+        }
         finally
         {
             ArrayPool<byte>.Shared.Return(chunk);
             _connAckTcs.TrySetCanceled();
+            foreach (var kv in _pendingSubAcks) kv.Value.TrySetCanceled();
+            _pendingSubAcks.Clear();
             _rxMessages.Writer.TryComplete();
         }
     }
@@ -209,7 +235,7 @@ public sealed class MqttWssClient : IAsyncDisposable
         if (off > body.Length) return false;
         topic = Encoding.UTF8.GetString(body, 2, topicLen);
         int qos = (header >> 1) & 0x03;
-        if (qos > 0) off += 2; // Skip 2B packet id if broker delivers QoS>0
+        if (qos > 0) off += 2;
         if (off > body.Length) return false;
         payload = body.AsSpan(off).ToArray();
         return true;
@@ -237,7 +263,7 @@ public sealed class MqttWssClient : IAsyncDisposable
         ms.WriteByte((byte)(packetId >> 8));
         ms.WriteByte((byte)(packetId & 0xFF));
         WriteUtf8String(ms, tBytes);
-        ms.WriteByte(0x00); // QoS 0
+        ms.WriteByte(0x00);
         return ms.ToArray();
     }
 
@@ -246,7 +272,7 @@ public sealed class MqttWssClient : IAsyncDisposable
         var tBytes = Encoding.UTF8.GetBytes(topic);
         int remLen = 2 + tBytes.Length + payload.Length;
         using var ms = new MemoryStream(remLen + 5);
-        ms.WriteByte(0x30); // PUBLISH QoS 0
+        ms.WriteByte(0x30);
         WriteRemainingLength(ms, remLen);
         WriteUtf8String(ms, tBytes);
         ms.Write(payload);
@@ -287,12 +313,11 @@ public sealed class MqttWssClient : IAsyncDisposable
 }
 
 /// <summary>
-/// Full ITransportChannel over MQTT-over-WSS with automatic 40 KB packet chunking & reassembly.
-/// Wire-compatible with Android MqttWssTransport.
+/// Full ITransportChannel over MQTT-over-WSS with automatic 28 KB packet chunking & reassembly.
 /// </summary>
 public sealed class MqttPipeTransportChannel : ITransportChannel
 {
-    private const int MaxChunkBody = 40 * 1024;
+    private const int MaxChunkBody = 28 * 1024;
     private readonly MqttWssClient _mqtt;
     private readonly string _txTopic;
     private readonly string _rxTopic;

@@ -21,6 +21,7 @@ import java.util.concurrent.TimeUnit
 class MqttWssClient {
     private val rxMessages = Channel<Pair<String, ByteArray>>(Channel.UNLIMITED)
     private val connAck = Channel<Boolean>(1)
+    private val subAcks = ConcurrentHashMap<Int, kotlinx.coroutines.CompletableDeferred<Boolean>>()
     private val streamBuf = ByteArrayOutputStream()
     private val client = OkHttpClient.Builder()
         .pingInterval(15, TimeUnit.SECONDS)
@@ -97,6 +98,10 @@ class MqttWssClient {
 
                 when (hdr ushr 4) {
                     2 -> connAck.trySend(body.size >= 2 && body[1].toInt() == 0)
+                    9 -> if (body.size >= 2) {
+                        val pid = ((body[0].toInt() and 0xFF) shl 8) or (body[1].toInt() and 0xFF)
+                        subAcks.remove(pid)?.complete(true)
+                    }
                     3 -> decodePublish(hdr, body)
                 }
             }
@@ -134,8 +139,10 @@ class MqttWssClient {
         ws.send(b.toByteString(0, b.size))
     }
 
-    fun subscribe(topic: String) {
-        val pid = nextPacketId++
+    suspend fun subscribe(topic: String) {
+        val pid = (nextPacketId++ % 65000) + 1
+        val def = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        subAcks[pid] = def
         val t = topic.toByteArray(Charsets.UTF_8)
         val remLen = 2 + 2 + t.size + 1
         val out = ByteArrayOutputStream(remLen + 5)
@@ -149,6 +156,8 @@ class MqttWssClient {
         out.write(0x00)
         val b = out.toByteArray()
         ws.send(b.toByteString(0, b.size))
+        kotlinx.coroutines.withTimeoutOrNull(4500) { def.await() }
+        subAcks.remove(pid)
     }
 
     fun publish(topic: String, payload: ByteArray) {
@@ -205,7 +214,7 @@ class MqttPipeTransportChannel(
     override val modeLabel: String = "WssMesh"
     override val isConnected: Boolean get() = mqtt.isConnected
 
-    fun subscribeRx() = mqtt.subscribe(rxTopic)
+    suspend fun subscribeRx() = mqtt.subscribe(rxTopic)
 
     override suspend fun sendPacket(type: PacketType, payload: ByteArray, compress: Boolean) {
         var flags: Byte = 0
@@ -215,7 +224,7 @@ class MqttPipeTransportChannel(
         } else payload
         val rawFrame = FrameCodec.encodePlain(type, data, flags)
         val msgId = nextMsgId++
-        val maxBody = 40 * 1024
+        val maxBody = 28 * 1024
         val partCount = maxOf(1, (rawFrame.size + maxBody - 1) / maxBody)
 
         for (p in 0 until partCount) {

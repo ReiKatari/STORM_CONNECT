@@ -338,4 +338,40 @@ public sealed class ProtocolAndEngineTests
         var files = await filesTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.NotEmpty(files.Entries);
     }
+
+    [Fact]
+    public async Task EndToEnd_PublicMqttWss_MultiBroker_AndKeepAlive()
+    {
+        string hostId = RandomNumberGenerator.GetInt32(820_000_000, 899_999_999).ToString();
+        string clientId = RandomNumberGenerator.GetInt32(720_000_000, 799_999_999).ToString();
+        const string pin = "445566";
+
+        using var hostClip = new ClipboardWatcher();
+        using var clientClip = new ClipboardWatcher();
+        await using var host = new HostServer(
+            hostId,
+            () => pin,
+            () => (null, null),
+            () => new SessionPermissions(),
+            () => true,
+            _ => Task.FromResult(new ConsentDecisionPayload(false, new SessionPermissions())),
+            hostClip);
+
+        host.Start(0, "", enableRelay: true);
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (host.ConnectedBrokerCount < 2 && sw.ElapsedMilliseconds < 10000) await Task.Delay(100);
+        Assert.True(host.ConnectedBrokerCount >= 2, $"Expected >=2 mesh brokers, got {host.ConnectedBrokerCount}");
+
+        await using var client = new ClientSession(clientId, clientClip);
+        var monsTcs = new TaskCompletionSource<IReadOnlyList<MonitorInfo>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        client.MonitorsUpdated += m => monsTcs.TrySetResult(m);
+
+        await client.ConnectAsync(hostId, "", Array.Empty<DiscoveredDevice>(), (_, _) => Task.FromResult<string?>(pin), preferredMethodIndex: 3);
+        Assert.True(client.IsConnected);
+
+        var mons = await monsTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.NotEmpty(mons);
+        await Task.Delay(2200);
+        Assert.True(client.IsConnected);
+    }
 }

@@ -5,6 +5,7 @@ namespace StormConnect.Desktop.Engine;
 
 /// <summary>
 /// Zero-NuGet Win32 waveIn/waveOut PCM 16-bit 22050Hz mono audio streamer for low-latency session audio.
+/// Uses deterministic single-owner buffer cleanup to prevent use-after-close access violations.
 /// </summary>
 public sealed class AudioStreamer : IDisposable
 {
@@ -12,49 +13,54 @@ public sealed class AudioStreamer : IDisposable
     private const int Channels = 1;
     private const int BitsPerSample = 16;
     private const int BufferMs = 40;
+    private const uint WHDR_DONE = 0x00000001;
 
-    private IntPtr _hWaveOut;
     private readonly ConcurrentQueue<byte[]> _rxQueue = new();
     private CancellationTokenSource? _playCts;
     private CancellationTokenSource? _capCts;
+    private Task? _playTask;
+    private Task? _capTask;
     private bool _disposed;
 
     public event Action<byte[]>? AudioFrameCaptured;
 
     public void StartCapture()
     {
-        if (_capCts is not null) return;
+        if (_disposed || _capCts is not null) return;
         _capCts = new CancellationTokenSource();
         var ct = _capCts.Token;
-
-        Task.Run(() => CaptureLoop(ct), ct);
+        _capTask = Task.Run(() => CaptureLoop(ct), ct);
     }
 
     public void StopCapture()
     {
         _capCts?.Cancel();
+        try { _capTask?.Wait(500); } catch { }
         _capCts?.Dispose();
         _capCts = null;
+        _capTask = null;
     }
 
     public void StartPlayback()
     {
-        if (_playCts is not null) return;
+        if (_disposed || _playCts is not null) return;
         _playCts = new CancellationTokenSource();
         var ct = _playCts.Token;
-        Task.Run(() => PlaybackLoop(ct), ct);
+        _playTask = Task.Run(() => PlaybackLoop(ct), ct);
     }
 
     public void StopPlayback()
     {
         _playCts?.Cancel();
+        try { _playTask?.Wait(500); } catch { }
         _playCts?.Dispose();
         _playCts = null;
+        _playTask = null;
     }
 
     public void EnqueuePlaybackFrame(byte[] pcmBytes)
     {
-        if (_disposed || _playCts is null) return;
+        if (_disposed || _playCts is null || pcmBytes.Length == 0) return;
         while (_rxQueue.Count > 15) _rxQueue.TryDequeue(out _);
         _rxQueue.Enqueue(pcmBytes);
     }
@@ -87,7 +93,7 @@ public sealed class AudioStreamer : IDisposable
             while (!ct.IsCancellationRequested)
             {
                 var hdr = Marshal.PtrToStructure<WAVEHDR>(hdrPtrs[idx]);
-                if ((hdr.dwFlags & 0x00000001 /* WHDR_DONE */) != 0)
+                if ((hdr.dwFlags & WHDR_DONE) != 0)
                 {
                     if (hdr.dwBytesRecorded > 0)
                     {
@@ -95,7 +101,7 @@ public sealed class AudioStreamer : IDisposable
                         Marshal.Copy(hdr.lpData, data, 0, (int)hdr.dwBytesRecorded);
                         AudioFrameCaptured?.Invoke(data);
                     }
-                    hdr.dwFlags &= ~0x00000001u;
+                    hdr.dwFlags &= ~WHDR_DONE;
                     hdr.dwBytesRecorded = 0;
                     Marshal.StructureToPtr(hdr, hdrPtrs[idx], false);
                     waveInAddBuffer(hWaveIn, hdrPtrs[idx], (uint)Marshal.SizeOf<WAVEHDR>());
@@ -127,36 +133,52 @@ public sealed class AudioStreamer : IDisposable
     private void PlaybackLoop(CancellationToken ct)
     {
         var fmt = CreateWaveFormat();
-        if (waveOutOpen(out _hWaveOut, -1 /* WAVE_MAPPER */, ref fmt, IntPtr.Zero, IntPtr.Zero, 0) != 0)
+        if (waveOutOpen(out IntPtr hWaveOut, -1 /* WAVE_MAPPER */, ref fmt, IntPtr.Zero, IntPtr.Zero, 0) != 0 || hWaveOut == IntPtr.Zero)
             return;
+
+        var inFlight = new Queue<(IntPtr Hdr, IntPtr Data)>();
+        uint hdrSize = (uint)Marshal.SizeOf<WAVEHDR>();
+
+        void ReclaimCompleted(bool reclaimAll)
+        {
+            while (inFlight.Count > 0)
+            {
+                var (hdrPtr, dataPtr) = inFlight.Peek();
+                var hdr = Marshal.PtrToStructure<WAVEHDR>(hdrPtr);
+                if (!reclaimAll && (hdr.dwFlags & WHDR_DONE) == 0)
+                    break;
+
+                inFlight.Dequeue();
+                try { waveOutUnprepareHeader(hWaveOut, hdrPtr, hdrSize); } catch { }
+                Marshal.FreeHGlobal(hdrPtr);
+                Marshal.FreeHGlobal(dataPtr);
+            }
+        }
 
         try
         {
             while (!ct.IsCancellationRequested)
             {
+                ReclaimCompleted(reclaimAll: false);
+
                 if (_rxQueue.TryDequeue(out var pcm))
                 {
                     IntPtr dataPtr = Marshal.AllocHGlobal(pcm.Length);
                     Marshal.Copy(pcm, 0, dataPtr, pcm.Length);
                     var hdr = new WAVEHDR { lpData = dataPtr, dwBufferLength = (uint)pcm.Length };
-                    IntPtr hdrPtr = Marshal.AllocHGlobal(Marshal.SizeOf<WAVEHDR>());
+                    IntPtr hdrPtr = Marshal.AllocHGlobal((int)hdrSize);
                     Marshal.StructureToPtr(hdr, hdrPtr, false);
 
-                    waveOutPrepareHeader(_hWaveOut, hdrPtr, (uint)Marshal.SizeOf<WAVEHDR>());
-                    waveOutWrite(_hWaveOut, hdrPtr, (uint)Marshal.SizeOf<WAVEHDR>());
-
-                    // Asynchronous cleanup after buffer finishes
-                    _ = Task.Delay(BufferMs * 3, CancellationToken.None).ContinueWith(_ =>
+                    if (waveOutPrepareHeader(hWaveOut, hdrPtr, hdrSize) == 0 &&
+                        waveOutWrite(hWaveOut, hdrPtr, hdrSize) == 0)
                     {
-                        try
-                        {
-                            if (_hWaveOut != IntPtr.Zero)
-                                waveOutUnprepareHeader(_hWaveOut, hdrPtr, (uint)Marshal.SizeOf<WAVEHDR>());
-                        }
-                        catch { }
+                        inFlight.Enqueue((hdrPtr, dataPtr));
+                    }
+                    else
+                    {
                         Marshal.FreeHGlobal(hdrPtr);
                         Marshal.FreeHGlobal(dataPtr);
-                    });
+                    }
                 }
                 else
                 {
@@ -167,17 +189,15 @@ public sealed class AudioStreamer : IDisposable
         catch { }
         finally
         {
-            if (_hWaveOut != IntPtr.Zero)
-            {
-                try { waveOutReset(_hWaveOut); waveOutClose(_hWaveOut); } catch { }
-                _hWaveOut = IntPtr.Zero;
-            }
+            try { waveOutReset(hWaveOut); } catch { }
+            ReclaimCompleted(reclaimAll: true);
+            try { waveOutClose(hWaveOut); } catch { }
         }
     }
 
     private static WAVEFORMATEX CreateWaveFormat() => new()
     {
-        wFormatTag = 1, // PCM
+        wFormatTag = 1,
         nChannels = Channels,
         nSamplesPerSec = SampleRate,
         wBitsPerSample = BitsPerSample,

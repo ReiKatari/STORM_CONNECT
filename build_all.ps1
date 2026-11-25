@@ -7,7 +7,7 @@ try { [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.
 $baseDir = $PSScriptRoot
 if (-not $baseDir) { $baseDir = "f:\STORM CONNECT" }
 
-$appVersion = "1.2.0"
+$appVersion = "1.2.1"
 $appDisplayName = "STORM CONNECT"
 $filesDir = Join-Path $baseDir "Files"
 $secretsDir = "F:\STORM ALL PROJECTS\.storm-secrets"

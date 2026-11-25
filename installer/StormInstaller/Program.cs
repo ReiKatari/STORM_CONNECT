@@ -376,7 +376,7 @@ namespace StormConnect.Installer
     public sealed class InstallerForm : Form
     {
         private const string AppDisplayName = "STORM CONNECT";
-        private const string AppVersion = "1.2.0";
+        private const string AppVersion = "1.2.1";
         private const string AppFolderName = "STORM CONNECT";
         private const string ExeName = "STORM CONNECT.exe";
         private const string IcoName = "AppIcon.ico";

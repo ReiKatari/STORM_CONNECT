@@ -51,8 +51,11 @@ public sealed class HostServer : IAsyncDisposable
     private string _relayUrl = ProtocolConstants.DefaultRelayUrl;
     private readonly ConcurrentDictionary<string, ITransportChannel> _activeClients = new();
     private readonly ConcurrentDictionary<string, HostSessionContext> _activeContexts = new();
+    private readonly ConcurrentDictionary<string, DateTime> _seenMeshTokens = new();
+    private int _connectedBrokerCount;
 
     public bool IsRelayConnected { get; private set; }
+    public int ConnectedBrokerCount => Volatile.Read(ref _connectedBrokerCount);
     public int ActiveClientCount => _activeClients.Count;
     public int ListeningPort { get; private set; }
     public string? ActiveRelayEndpoint { get; private set; }
@@ -114,9 +117,96 @@ public sealed class HostServer : IAsyncDisposable
         _relayCts = CancellationTokenSource.CreateLinkedTokenSource(_cts!.Token);
         var ct = _relayCts.Token;
         if (string.IsNullOrWhiteSpace(relayUrl))
-            Task.Run(() => PublicMqttMeshControlLoopAsync(ct), ct);
+        {
+            foreach (var broker in ProtocolConstants.PublicMqttWssBrokers)
+                Task.Run(() => PublicMqttMeshBrokerLoopAsync(broker, ct), ct);
+        }
         else
+        {
             Task.Run(() => RelayControlLoopAsync(relayUrl, ct), ct);
+        }
+    }
+
+    private async Task PublicMqttMeshBrokerLoopAsync(string brokerUrl, CancellationToken ct)
+    {
+        int backoffMs = 1500;
+        while (!ct.IsCancellationRequested)
+        {
+            bool countedOnline = false;
+            await using var mqtt = new MqttWssClient();
+            try
+            {
+                string cid = $"sc_h_{_stormId}_{Guid.NewGuid().ToString("N")[..6]}";
+                await mqtt.ConnectAsync(brokerUrl, cid, ct).ConfigureAwait(false);
+                await mqtt.SubscribeAsync($"sc/v1/s/{_stormId}", ct).ConfigureAwait(false);
+
+                int nowOnline = Interlocked.Increment(ref _connectedBrokerCount);
+                countedOnline = true;
+                IsRelayConnected = nowOnline > 0;
+                ActiveRelayEndpoint = $"{nowOnline}/{ProtocolConstants.PublicMqttWssBrokers.Length} WSS Mesh";
+                RelayStatusChanged?.Invoke(true);
+                backoffMs = 1500;
+
+                while (mqtt.IsConnected && !ct.IsCancellationRequested)
+                {
+                    var msg = await mqtt.ReadMessageAsync(ct).ConfigureAwait(false);
+                    if (msg is null) break;
+
+                    try
+                    {
+                        using var doc = JsonDocument.Parse(msg.Value.Payload);
+                        var token = doc.RootElement.TryGetProperty("Token", out var tp) ? tp.GetString() : null;
+                        var fromId = doc.RootElement.TryGetProperty("FromStormId", out var fp) ? fp.GetString() : "Peer";
+                        if (!string.IsNullOrWhiteSpace(token) && _seenMeshTokens.TryAdd(token!, DateTime.UtcNow))
+                        {
+                            // Prune old tokens
+                            foreach (var kv in _seenMeshTokens)
+                                if ((DateTime.UtcNow - kv.Value).TotalMinutes > 3) _seenMeshTokens.TryRemove(kv.Key, out _);
+
+                            _ = Task.Run(() => HandlePublicMeshSessionAsync(brokerUrl, token!, fromId ?? "Peer", ct), ct);
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch (OperationCanceledException) { break; }
+            catch { }
+            finally
+            {
+                if (countedOnline)
+                {
+                    int rem = Interlocked.Decrement(ref _connectedBrokerCount);
+                    IsRelayConnected = rem > 0;
+                    ActiveRelayEndpoint = rem > 0 ? $"{rem}/{ProtocolConstants.PublicMqttWssBrokers.Length} WSS Mesh" : null;
+                    RelayStatusChanged?.Invoke(rem > 0);
+                }
+            }
+
+            try
+            {
+                await Task.Delay(backoffMs, ct).ConfigureAwait(false);
+                backoffMs = Math.Min(15_000, backoffMs * 2);
+            }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
+    private async Task HandlePublicMeshSessionAsync(string brokerUrl, string token, string peerStormId, CancellationToken ct)
+    {
+        try
+        {
+            var mqtt = new MqttWssClient();
+            string cid = $"sc_hs_{_stormId}_{Guid.NewGuid().ToString("N")[..6]}";
+            await mqtt.ConnectAsync(brokerUrl, cid, ct).ConfigureAwait(false);
+            var pipe = new MqttPipeTransportChannel(mqtt, token, isInitiator: false);
+            await pipe.SubscribeRxAsync(ct).ConfigureAwait(false);
+            await Task.Delay(120, ct).ConfigureAwait(false);
+            await HandleIncomingChannelAsync(pipe, $"Mesh:{peerStormId}", ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            AuditLogEvent?.Invoke($"Public mesh session error: {ex.Message}");
+        }
     }
 
     private async Task AcceptTcpLoopAsync(CancellationToken ct)
@@ -150,80 +240,6 @@ public sealed class HostServer : IAsyncDisposable
         catch (Exception ex)
         {
             AuditLogEvent?.Invoke($"Direct TCP listener stopped: {ex.Message}");
-        }
-    }
-
-    private async Task PublicMqttMeshControlLoopAsync(CancellationToken ct)
-    {
-        int brokerIdx = 0;
-        int backoffMs = 1500;
-
-        while (!ct.IsCancellationRequested)
-        {
-            string brokerUrl = ProtocolConstants.PublicMqttWssBrokers[brokerIdx % ProtocolConstants.PublicMqttWssBrokers.Length];
-            await using var mqtt = new MqttWssClient();
-            try
-            {
-                string cid = $"sc_h_{_stormId}_{Guid.NewGuid().ToString("N")[..6]}";
-                await mqtt.ConnectAsync(brokerUrl, cid, ct).ConfigureAwait(false);
-                await mqtt.SubscribeAsync($"sc/v1/s/{_stormId}", ct).ConfigureAwait(false);
-
-                IsRelayConnected = true;
-                ActiveRelayEndpoint = brokerUrl;
-                RelayStatusChanged?.Invoke(true);
-                backoffMs = 1500;
-
-                while (mqtt.IsConnected && !ct.IsCancellationRequested)
-                {
-                    var msg = await mqtt.ReadMessageAsync(ct).ConfigureAwait(false);
-                    if (msg is null) break;
-
-                    try
-                    {
-                        using var doc = JsonDocument.Parse(msg.Value.Payload);
-                        var token = doc.RootElement.TryGetProperty("Token", out var tp) ? tp.GetString() : null;
-                        var fromId = doc.RootElement.TryGetProperty("FromStormId", out var fp) ? fp.GetString() : "Peer";
-                        if (!string.IsNullOrWhiteSpace(token))
-                        {
-                            _ = Task.Run(() => HandlePublicMeshSessionAsync(brokerUrl, token!, fromId ?? "Peer", ct), ct);
-                        }
-                    }
-                    catch { }
-                }
-            }
-            catch (OperationCanceledException) { break; }
-            catch { }
-            finally
-            {
-                IsRelayConnected = false;
-                ActiveRelayEndpoint = null;
-                RelayStatusChanged?.Invoke(false);
-            }
-
-            brokerIdx++;
-            try
-            {
-                await Task.Delay(backoffMs, ct).ConfigureAwait(false);
-                backoffMs = Math.Min(15_000, backoffMs * 2);
-            }
-            catch (OperationCanceledException) { break; }
-        }
-    }
-
-    private async Task HandlePublicMeshSessionAsync(string brokerUrl, string token, string peerStormId, CancellationToken ct)
-    {
-        try
-        {
-            var mqtt = new MqttWssClient();
-            string cid = $"sc_hs_{_stormId}_{Guid.NewGuid().ToString("N")[..6]}";
-            await mqtt.ConnectAsync(brokerUrl, cid, ct).ConfigureAwait(false);
-            var pipe = new MqttPipeTransportChannel(mqtt, token, isInitiator: false);
-            await pipe.SubscribeRxAsync(ct).ConfigureAwait(false);
-            await HandleIncomingChannelAsync(pipe, $"Mesh:{peerStormId}", ct).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            AuditLogEvent?.Invoke($"Public mesh session error: {ex.Message}");
         }
     }
 
@@ -337,7 +353,17 @@ public sealed class HostServer : IAsyncDisposable
             crypto = new CryptoSession();
             await rawChannel.SendPacketAsync(PacketType.KeyExchange, crypto.LocalPublicKeyUncompressed, ct: ct).ConfigureAwait(false);
 
-            var peerKeyPkt = await rawChannel.ReceivePacketAsync(ct).ConfigureAwait(false);
+            using var keyWaitCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            keyWaitCts.CancelAfter(TimeSpan.FromSeconds(12));
+            var rxTask = rawChannel.ReceivePacketAsync(keyWaitCts.Token);
+
+            // If over WssRelay and client hasn't replied after 1.5s (broker route warm-up), re-send Host KeyExchange once
+            if (rawChannel.Mode == ConnectionMode.WssRelay && await Task.WhenAny(rxTask, Task.Delay(1500, keyWaitCts.Token)).ConfigureAwait(false) != rxTask)
+            {
+                await rawChannel.SendPacketAsync(PacketType.KeyExchange, crypto.LocalPublicKeyUncompressed, ct: keyWaitCts.Token).ConfigureAwait(false);
+            }
+
+            var peerKeyPkt = await rxTask.ConfigureAwait(false);
             if (peerKeyPkt is null || peerKeyPkt.Type != PacketType.KeyExchange)
                 return;
             crypto.DeriveKeys(peerKeyPkt.Payload, isInitiator: false);
@@ -347,7 +373,7 @@ public sealed class HostServer : IAsyncDisposable
 
             // 2. Send Hello + AuthChallenge
             var monitors = DxgiScreenCapturer.GetMonitors();
-            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.2.0", monitors.Count(m => m.Index >= 0), true);
+            var hello = new HelloPayload(_stormId, Environment.MachineName, "Windows", "1.2.1", monitors.Count(m => m.Index >= 0), true);
             await channel.SendPacketAsync(PacketType.Hello, FrameCodec.SerializeJson(hello), ct: ct).ConfigureAwait(false);
 
             var pinSalt = RandomNumberGenerator.GetBytes(16);
@@ -448,7 +474,7 @@ public sealed class HostServer : IAsyncDisposable
 
         int activeMonitor = 0;
         bool forceKeyFrame = true;
-        int targetQuality = 72;
+        int targetQuality = channel.Mode == ConnectionMode.WssRelay ? 55 : 75;
         using var capturer = new DxgiScreenCapturer();
         var encoder = new TileDeltaEncoder();
         using var audio = new AudioStreamer();
@@ -496,7 +522,7 @@ public sealed class HostServer : IAsyncDisposable
                 catch { break; }
 
                 int elapsed = (int)sw.ElapsedMilliseconds;
-                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 33 : 20; // 30-50 FPS smooth adaptive
+                int targetInterval = channel.Mode == ConnectionMode.WssRelay ? 85 : 20; // Safe pacing over public WSS mesh vs 50 FPS LAN
                 if (elapsed < targetInterval)
                 {
                     try { await Task.Delay(targetInterval - elapsed, ct).ConfigureAwait(false); }

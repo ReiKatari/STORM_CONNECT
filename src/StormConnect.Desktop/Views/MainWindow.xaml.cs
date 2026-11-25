@@ -422,6 +422,7 @@ public partial class MainWindow : Window
     private void UpdateRelayBadge(bool online)
     {
         TxtRelayBadge.Text = online ? LocalizationService.T("RelayOnline") : LocalizationService.T("RelayOffline");
+        TxtRelayBadge.ToolTip = _hostServer?.ActiveRelayEndpoint ?? TxtRelayBadge.Text;
         DotRelayStatus.Fill = (Brush)FindResource(online ? "ThemeSuccess" : "ThemeWarning");
     }
 
